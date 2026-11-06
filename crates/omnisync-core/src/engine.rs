@@ -27,6 +27,17 @@ struct PendingPreview {
     expires: i64,
     paths: Vec<(String, String)>,
 }
+mod cleanup;
+struct StatusService {
+    task: tokio::task::JoinHandle<()>,
+    cache: Arc<Cache>,
+}
+impl Drop for StatusService {
+    fn drop(&mut self) {
+        self.task.abort();
+        self.cache.invalidate();
+    }
+}
 pub struct Engine {
     pub state: PathBuf,
     store: Mutex<Store>,
@@ -35,6 +46,8 @@ pub struct Engine {
     progress: Mutex<Progress>,
     summary: Mutex<Counts>,
     previews: Mutex<HashMap<String, PendingPreview>>,
+    cleanup_previews: Mutex<HashMap<String, cleanup::CleanupPlan>>,
+    cleanup_running: AtomicBool,
     wake: tokio::sync::Notify,
     dirty: AtomicBool,
     force: AtomicBool,
@@ -52,6 +65,15 @@ impl Engine {
     fn open_with_cache(state: PathBuf, cache: Cache) -> Result<Arc<Self>> {
         security::private_directory(&state, false)?;
         let store = Store::open(&state.join("state.sqlite"))?;
+        // 0.1.0 did not persist coverage per item. Republish its known versions once;
+        // this does not upload file contents again or change source configuration.
+        if store.items()?.iter().any(|i| {
+            i.current
+                .as_ref()
+                .is_some_and(|v| i.cataloged_remote_id.as_deref() != Some(&v.remote_id))
+        }) {
+            store.set("catalogDirty", &true)?;
+        }
         let last_backup = store.setting::<i64>("lastBackup")?;
         let auth = Auth::new(&state)?;
         let drive = Drive::new(auth.clone())?;
@@ -67,6 +89,8 @@ impl Engine {
             }),
             summary: Mutex::new(Counts::default()),
             previews: Mutex::new(HashMap::new()),
+            cleanup_previews: Mutex::new(HashMap::new()),
+            cleanup_running: AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
             dirty: AtomicBool::new(true),
             force: AtomicBool::new(false),
@@ -92,25 +116,17 @@ impl Engine {
             .setting("account")?
             .unwrap_or_default())
     }
-    pub async fn snapshot(&self) -> Result<Snapshot> {
+    pub async fn snapshot(self: &Arc<Self>) -> Result<Snapshot> {
+        let connected = self.auth.connected().await;
+        let configured = self.auth.configured().await;
+        let engine = self.clone();
+        tokio::task::spawn_blocking(move || engine.snapshot_local(connected, configured)).await?
+    }
+    fn snapshot_local(&self, connected: bool, oauth_configured: bool) -> Result<Snapshot> {
         let config = self.config()?;
         let mut account = self.account()?;
-        account.connected = self.auth.connected().await;
-        let mut recent = self.items()?;
-        if self
-            .store
-            .lock()
-            .unwrap()
-            .setting::<bool>("catalogDirty")?
-            .unwrap_or(false)
-        {
-            for item in &mut recent {
-                if item.status == Status::BackedUp {
-                    item.status = Status::Pending;
-                    item.reason = "Publishing recovery catalog".into();
-                }
-            }
-        }
+        account.connected = connected;
+        let mut recent = self.display_items()?;
         let mut counts = Counts::default();
         for item in &recent {
             match item.status {
@@ -135,9 +151,19 @@ impl Engine {
             progress,
             counts,
             recent,
-            oauth_configured: self.auth.configured().await,
+            oauth_configured,
             version: env!("CARGO_PKG_VERSION").into(),
         })
+    }
+    pub fn display_items(&self) -> Result<Vec<Item>> {
+        let mut items = self.items()?;
+        for item in &mut items {
+            if item.status != item.effective_status() {
+                item.status = Status::Pending;
+                item.reason = "Publishing recovery catalog".into();
+            }
+        }
+        Ok(items)
     }
     pub fn tray_status(&self) -> Result<(bool, String, Counts)> {
         let paused = self.config()?.paused();
@@ -155,7 +181,7 @@ impl Engine {
     }
     pub fn rescan(&self) {
         self.dirty.store(true, Ordering::SeqCst);
-        self.cache.invalidate();
+        self.cache.mark_pending(None);
         self.wake.notify_one();
     }
     pub fn sync_now(&self) -> Result<()> {
@@ -169,6 +195,10 @@ impl Engine {
     }
     pub fn pause(&self, seconds: Option<i64>) -> Result<()> {
         let mut s = self.store.lock().unwrap();
+        anyhow::ensure!(
+            !self.cleanup_running.load(Ordering::SeqCst),
+            "Wait for cloud cleanup to finish before changing backup preferences"
+        );
         let mut c = s.config()?;
         let expected = c.revision;
         c.revision += 1;
@@ -184,6 +214,14 @@ impl Engine {
         self.wake.notify_one();
     }
     fn permitted(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.cleanup_running.load(Ordering::SeqCst),
+            "Backup is yielding at a checkpoint for cloud cleanup"
+        );
+        anyhow::ensure!(
+            !self.dirty.load(Ordering::SeqCst),
+            "Checking changed source files before continuing backup"
+        );
         anyhow::ensure!(!self.stopping.load(Ordering::SeqCst), "OmniSync is closing");
         anyhow::ensure!(
             !self.config()?.paused(),
@@ -368,6 +406,10 @@ impl Engine {
             );
         }
         let mut s = self.store.lock().unwrap();
+        anyhow::ensure!(
+            !self.cleanup_running.load(Ordering::SeqCst),
+            "Wait for cloud cleanup to finish before changing exclusions"
+        );
         s.save_config(&preview.config, preview.config.revision - 1)?;
         drop(s);
         self.rescan();
@@ -460,6 +502,7 @@ impl Engine {
     }
     fn scan(&self) -> Result<()> {
         let _scan = self.scan_lock.lock().unwrap();
+        let scan_epoch = self.cache.epoch();
         self.phase("scanning", "Checking selected folders");
         let config = self.config()?;
         let matcher = Matcher::new(&config.rules)?;
@@ -498,6 +541,7 @@ impl Engine {
                         reason: String::new(),
                         winning_rule: None,
                         current: None,
+                        cataloged_remote_id: None,
                         history: vec![],
                         last_seen: epoch,
                     });
@@ -581,31 +625,28 @@ impl Engine {
             self.store.lock().unwrap().put_item(&item)?;
         }
         self.store.lock().unwrap().set("scanErrors", &failures)?;
-        self.publish_cache()?;
+        self.publish_cache_scanned(Some(scan_epoch))?;
         if !failures.is_empty() {
             self.phase("issue", &failures.join("; "));
         }
         Ok(())
     }
     fn publish_cache(&self) -> Result<()> {
-        if self.dirty.load(Ordering::SeqCst) {
+        self.publish_cache_scanned(None)
+    }
+    fn publish_cache_scanned(&self, scanned_through: Option<u64>) -> Result<()> {
+        if self.stopping.load(Ordering::SeqCst) {
             return Ok(());
         }
         let config = self.config()?;
         let items = self.items()?;
         let mut paths = vec![];
         let mut folders: HashMap<PathBuf, u32> = HashMap::new();
-        let dirty_catalog = self
-            .store
-            .lock()
-            .unwrap()
-            .setting::<bool>("catalogDirty")?
-            .unwrap_or(false);
         let mut summary = Counts::default();
         for item in &items {
-            match item.status {
-                Status::BackedUp if !dirty_catalog => summary.backed_up += 1,
-                Status::BackedUp | Status::Pending | Status::Syncing => summary.pending += 1,
+            match item.effective_status() {
+                Status::BackedUp => summary.backed_up += 1,
+                Status::Pending | Status::Syncing => summary.pending += 1,
                 Status::Excluded => summary.excluded += 1,
                 Status::Issue => summary.issues += 1,
                 Status::Retained => summary.retained += 1,
@@ -614,10 +655,7 @@ impl Engine {
         *self.summary.lock().unwrap() = summary;
         for root in &config.roots {
             for item in items.iter().filter(|i| i.root_id == root.id) {
-                let mut state = item.status.overlay();
-                if dirty_catalog && state == 1 {
-                    state = 3;
-                }
+                let state = item.effective_status().overlay();
                 let path = if root.is_file {
                     PathBuf::from(&root.path)
                 } else {
@@ -641,11 +679,7 @@ impl Engine {
             }
         }
         paths.extend(folders);
-        self.cache.publish(&paths)?;
-        // A watcher may have invalidated during publication; never revive that stale cache.
-        if self.dirty.load(Ordering::SeqCst) {
-            self.cache.invalidate();
-        }
+        self.cache.publish_scanned(&paths, scanned_through)?;
         Ok(())
     }
     fn update_watchers(self: &Arc<Self>) -> Result<()> {
@@ -661,9 +695,17 @@ impl Engine {
         }
         let weak = Arc::downgrade(self);
         let mut watcher =
-            notify::recommended_watcher(move |_event: notify::Result<notify::Event>| {
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                 if let Some(engine) = weak.upgrade() {
-                    engine.rescan();
+                    match event {
+                        Ok(event) if matches!(event.kind, notify::EventKind::Access(_)) => {}
+                        Ok(event) if !event.paths.is_empty() && !event.need_rescan() => {
+                            engine.cache.mark_pending(Some(&event.paths));
+                            engine.dirty.store(true, Ordering::SeqCst);
+                            engine.wake.notify_one();
+                        }
+                        _ => engine.rescan(),
+                    }
                 }
             })?;
         for root in &roots {
@@ -674,6 +716,38 @@ impl Engine {
         Ok(())
     }
     pub async fn run(self: Arc<Self>) {
+        // This task never scans or waits for a cloud request. Its lifetime follows the engine.
+        let weak = Arc::downgrade(&self);
+        let status_task = tokio::spawn(async move {
+            let mut notification: Option<tokio::task::JoinHandle<()>> = None;
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let Some(engine) = weak.upgrade() else {
+                    break;
+                };
+                if engine.stopping.load(Ordering::SeqCst) {
+                    break;
+                }
+                engine.cache.heartbeat();
+                if notification
+                    .as_ref()
+                    .is_some_and(|task| !task.is_finished())
+                {
+                    continue;
+                }
+                let paths = engine.cache.drain_changes(256);
+                if !paths.is_empty() {
+                    notification = Some(tokio::task::spawn_blocking(move || {
+                        omnisync_windows::integration::refresh_overlays(&paths)
+                    }));
+                }
+            }
+        });
+        // Cancellation and unexpected worker exit must also stop the heartbeat.
+        let _status = StatusService {
+            task: status_task,
+            cache: self.cache.clone(),
+        };
         let mut reconciled = 0;
         let mut remote_checked = 0;
         loop {
@@ -681,6 +755,11 @@ impl Engine {
                 break;
             }
             let _guard = self.run_lock.lock().await;
+            if self.cleanup_running.load(Ordering::SeqCst) {
+                drop(_guard);
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                continue;
+            }
             let forced = self.force.swap(false, Ordering::SeqCst);
             let config = match self.config() {
                 Ok(c) => c,
@@ -876,13 +955,22 @@ impl Engine {
         self.store.lock().unwrap().set("account", &account)?;
         Ok(parent)
     }
-    async fn backup_pending(&self) -> Result<()> {
+    async fn backup_pending(self: &Arc<Self>) -> Result<()> {
+        let mut checkpoint = std::time::Instant::now();
+        let mut completed = 0;
         for mut item in self
             .items()?
             .into_iter()
             .filter(|i| i.status == Status::Pending || i.status == Status::Syncing)
         {
             self.permitted()?;
+            if completed > 0
+                && (item.size >= CHUNK as u64 || checkpoint.elapsed() >= Duration::from_secs(5))
+            {
+                self.save_catalog().await?;
+                completed = 0;
+                checkpoint = std::time::Instant::now();
+            }
             let config = self.config()?;
             if item.reason == "Upload verified; publishing recovery catalog" {
                 continue;
@@ -954,6 +1042,13 @@ impl Engine {
                     latest.reason = "Upload verified; publishing recovery catalog".into();
                     self.store.lock().unwrap().commit_verified(&latest)?;
                     self.remove_stage(&job);
+                    completed += 1;
+                    // Bound progress latency without rewriting a full catalog after every tiny file.
+                    if completed >= 8 || checkpoint.elapsed() >= Duration::from_secs(5) {
+                        self.save_catalog().await?;
+                        completed = 0;
+                        checkpoint = std::time::Instant::now();
+                    }
                 }
                 Err(error) => {
                     job.attempts = job.attempts.saturating_add(1);
@@ -1195,7 +1290,7 @@ impl Engine {
             self.store.lock().unwrap().put_job(job)
         }
     }
-    async fn save_catalog(&self) -> Result<()> {
+    async fn save_catalog(self: &Arc<Self>) -> Result<()> {
         if !self
             .store
             .lock()
@@ -1269,20 +1364,72 @@ impl Engine {
         self.drive
             .mark_catalog(job.target_id.as_ref().unwrap())
             .await?;
-        let mut account = self.account()?;
-        account.catalog_id = job.target_id.clone();
-        self.store.lock().unwrap().set("account", &account)?;
-        self.store
-            .lock()
-            .unwrap()
-            .set("catalogJob", &Option::<Job>::None)?;
-        self.store.lock().unwrap().set("catalogDirty", &false)?;
+        let catalog: Catalog = serde_json::from_reader(File::open(&job.stage)?)?;
+        self.store.lock().unwrap().commit_catalog(
+            &catalog,
+            job.target_id.as_ref().unwrap(),
+            now(),
+        )?;
         self.remove_stage(&job);
         self.progress.lock().unwrap().last_backup = Some(now());
-        self.store.lock().unwrap().set("lastBackup", &now())?;
-        let e = self;
-        e.scan()?;
+        let engine = self.clone();
+        tokio::task::spawn_blocking(move || engine.reconcile_cataloged()).await??;
         Ok(())
+    }
+    fn reconcile_cataloged(&self) -> Result<()> {
+        let config = self.config()?;
+        let matcher = Matcher::new(&config.rules)?;
+        // Recheck only newly uploaded sources, not the entire tree on an async thread.
+        for mut item in self.items()?.into_iter().filter(|i| {
+            i.status == Status::Pending
+                && i.reason == "Upload verified; publishing recovery catalog"
+        }) {
+            let Some(version) = &item.current else {
+                continue;
+            };
+            if item.cataloged_remote_id.as_deref() != Some(&version.remote_id) {
+                continue;
+            }
+            let Some(root) = config
+                .roots
+                .iter()
+                .find(|r| r.id == item.root_id && r.enabled)
+            else {
+                continue;
+            };
+            if !matcher.decide(&root.id, &item.relative_path)?.included {
+                continue;
+            }
+            let path = if root.is_file {
+                PathBuf::from(&root.path)
+            } else {
+                Path::new(&root.path).join(filesystem::safe_relative(&item.relative_path)?)
+            };
+            let result = (|| -> Result<bool> {
+                let (_, identity, _) =
+                    filesystem::validate_root(Path::new(&root.path), &self.state)?;
+                anyhow::ensure!(identity == root.volume_identity, "Source root changed");
+                let (sha, _, size) =
+                    staging::hashes(filesystem::locked_source(&path, Path::new(&root.path))?)?;
+                Ok(sha == version.sha256 && size == version.size)
+            })();
+            match result {
+                Ok(true) => {
+                    item.status = Status::BackedUp;
+                    item.reason = "Verified backup matches local content".into();
+                }
+                Ok(false) => {
+                    item.generation += 1;
+                    item.reason = "Local content changed; waiting for verified backup".into();
+                }
+                Err(e) => {
+                    item.status = Status::Issue;
+                    item.reason = e.to_string();
+                }
+            }
+            self.store.lock().unwrap().put_item(&item)?;
+        }
+        self.publish_cache()
     }
     pub async fn catalogs(&self) -> Result<Value> {
         Ok(serde_json::to_value(self.drive.list_catalogs().await?)?)
@@ -1499,7 +1646,7 @@ mod tests {
         assert_eq!(aggregate(3, 2), 2);
         assert_eq!(aggregate(2, 5), 5);
     }
-    fn fixture() -> (tempfile::TempDir, Arc<Engine>, PathBuf) {
+    pub(super) fn fixture() -> (tempfile::TempDir, Arc<Engine>, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -1509,7 +1656,7 @@ mod tests {
             Engine::open_with_cache(temp.path().join("state"), Cache::isolated().unwrap()).unwrap();
         (temp, engine, source)
     }
-    fn select(engine: &Engine, source: &Path) {
+    pub(super) fn select(engine: &Engine, source: &Path) {
         let mut config = engine.config().unwrap();
         config.roots.push(Root {
             id: "root".into(),
@@ -1620,6 +1767,135 @@ mod tests {
             .find(|i| i.relative_path == "keep.txt")
             .unwrap();
         assert_eq!(item.status, Status::Retained);
+    }
+    #[tokio::test]
+    async fn catalog_checkpoints_advance_counts_without_demoting_covered_files() {
+        let (_temp, engine, source) = fixture();
+        select(&engine, &source);
+        std::fs::write(source.join("second.txt"), b"second").unwrap();
+        engine.scan().unwrap();
+        let mut items = engine
+            .items()
+            .unwrap()
+            .into_iter()
+            .filter(|i| i.status != Status::Excluded)
+            .collect::<Vec<_>>();
+        for (index, item) in items.iter_mut().enumerate() {
+            let (sha, md5, size) =
+                staging::hashes(File::open(source.join(&item.relative_path)).unwrap()).unwrap();
+            item.current = Some(Version {
+                remote_id: format!("remote-{index}"),
+                sha256: sha,
+                md5,
+                size,
+                verified_at: now(),
+            });
+            item.status = Status::Pending;
+            item.reason = "Upload verified; publishing recovery catalog".into();
+            engine.store.lock().unwrap().commit_verified(item).unwrap();
+        }
+        let mut catalog = Catalog {
+            schema_version: 1,
+            device_id: engine.config().unwrap().device_id,
+            committed_at: now(),
+            roots: vec![],
+            items: vec![items[0].clone()],
+        };
+        engine
+            .store
+            .lock()
+            .unwrap()
+            .commit_catalog(&catalog, "catalog-1", now())
+            .unwrap();
+        engine.reconcile_cataloged().unwrap();
+        let counts = engine.snapshot().await.unwrap().counts;
+        assert_eq!((counts.backed_up, counts.pending), (1, 1));
+        assert!(engine
+            .store
+            .lock()
+            .unwrap()
+            .setting::<bool>("catalogDirty")
+            .unwrap()
+            .unwrap());
+        catalog.items = items.clone();
+        engine
+            .store
+            .lock()
+            .unwrap()
+            .commit_catalog(&catalog, "catalog-2", now())
+            .unwrap();
+        engine.reconcile_cataloged().unwrap();
+        let counts = engine.snapshot().await.unwrap().counts;
+        assert_eq!((counts.backed_up, counts.pending), (2, 0));
+        // A resumed old catalog cannot cover a newer version uploaded since it was staged.
+        let mut newer = engine
+            .store
+            .lock()
+            .unwrap()
+            .item(&items[1].id)
+            .unwrap()
+            .unwrap();
+        newer.current.as_mut().unwrap().remote_id = "newer-copy".into();
+        newer.status = Status::Pending;
+        engine
+            .store
+            .lock()
+            .unwrap()
+            .commit_verified(&newer)
+            .unwrap();
+        engine
+            .store
+            .lock()
+            .unwrap()
+            .commit_catalog(&catalog, "old-resumed-catalog", now())
+            .unwrap();
+        assert_eq!(engine.snapshot().await.unwrap().counts.backed_up, 1);
+        assert!(engine
+            .store
+            .lock()
+            .unwrap()
+            .setting::<bool>("catalogDirty")
+            .unwrap()
+            .unwrap());
+    }
+    #[test]
+    fn cleanup_commits_only_the_selected_version_and_survives_restart() {
+        let (temp, engine, source) = fixture();
+        select(&engine, &source);
+        engine.scan().unwrap();
+        let mut item = engine
+            .items()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.relative_path == "skip.tmp")
+            .unwrap();
+        let version = Version {
+            remote_id: "current".into(),
+            sha256: "hash".into(),
+            md5: "md5".into(),
+            size: 5,
+            verified_at: now(),
+        };
+        item.current = Some(version.clone());
+        item.cataloged_remote_id = Some("current".into());
+        let mut older = version;
+        older.remote_id = "history".into();
+        item.history.push(older);
+        {
+            let mut store = engine.store.lock().unwrap();
+            store.put_item(&item).unwrap();
+            store
+                .record_cleanup("run", &item.id, "history", "requested")
+                .unwrap();
+            store.commit_cleanup("run", &item.id, "history").unwrap();
+        }
+        drop(engine);
+        let store = Store::open(&temp.path().join("state/state.sqlite")).unwrap();
+        let saved = store.item(&item.id).unwrap().unwrap();
+        assert_eq!(saved.current.unwrap().remote_id, "current");
+        assert!(saved.history.is_empty());
+        assert!(store.setting::<bool>("catalogDirty").unwrap().unwrap());
+        assert!(source.join("skip.tmp").exists());
     }
     #[test]
     fn restore_publish_never_overwrites_existing_destination() {

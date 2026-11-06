@@ -1,0 +1,101 @@
+{
+  "version": "0.1.0",
+  "status": "Initial development build and local checks completed; external release gates remain",
+  "checks": [
+    {
+      "name": "Rust workspace tests",
+      "result": "passed",
+      "tests": 24,
+      "coreTests": 17,
+      "windowsTests": 7
+    },
+    {
+      "name": "TypeScript strict typecheck and Vite production bundle",
+      "result": "passed"
+    },
+    {
+      "name": "Edge interface tests",
+      "result": "passed",
+      "tests": 10,
+      "scope": "Explicit mock IPC fixture; seven screens, pause/resume, configuration preview, animation and reduced motion, dark/light at 390/768/1440 pixels. Does not assert live native or Google behavior."
+    },
+    {
+      "name": "Release production protocol and bundled assets",
+      "result": "passed",
+      "detail": "All native binaries compiled with static CRT and remapped build paths. Tauri custom-protocol enabled; compile guard rejects a release without it."
+    },
+    {
+      "name": "Compiled Explorer DLL smoke test",
+      "result": "passed",
+      "detail": "Five overlay factories and three context commands instantiated, icon resources checked, unmanaged-path suppression and COM lifetime verified; no registration or command invocation."
+    },
+    {
+      "name": "Read-only Explorer inventory",
+      "result": "passed",
+      "registrations": 5,
+      "eligibleRegistrations": 4
+    },
+    {
+      "name": "NSIS installer compilation",
+      "result": "passed",
+      "installPages": 6,
+      "warnings": 0
+    },
+    {
+      "name": "Source and artifact review",
+      "result": "passed",
+      "detail": "No embedded credentials, private runtime files or personal build path prefixes detected in the reviewed source/binaries; npm audit reported zero vulnerabilities."
+    },
+    {
+      "name": "Native desktop visual interaction",
+      "result": "not completed",
+      "detail": "Computer-use native pipe unavailable on three attempts including runtime reset (Windows os error 2). Browser tests and COM smoke test do not replace native visual verification."
+    }
+  ],
+  "externalReleaseGates": [
+    "Native desktop visual interaction, tray behavior and system-browser sign-in on a functioning desktop test environment",
+    "Live Google OAuth, uploads, session recovery and fresh-profile restore with a dedicated test account",
+    "Administrator and standard-user install/uninstall, overlay takeover and failure rollback in a clean Windows VM",
+    "Production signing, Google consent branding and trusted sparse-package identity activation",
+    "Adversarial filesystem races, large-tree scaling and dependency/license review before production distribution"
+  ],
+  "sideEffects": {
+    "personalGoogleAccountConnected": false,
+    "applicationInstalledOnDevelopmentMachine": false,
+    "productionExplorerRegistrationsChanged": false
+  },
+  "checkedAt": "2026-11-06T02:37:51.290146+00:00",
+  "environment": {
+    "os": "Windows x64",
+    "rust": "1.98.1",
+    "node": "24.18.0",
+    "nsis": "3.11 Unicode",
+    "browser": "Microsoft Edge headless"
+  },
+  "artifacts": [
+    {
+      "name": "omnisync.exe",
+      "bytes": 16280576,
+      "sha256": "d68dff56597ddc8e75c375b231fa2872449af26c4f2d04d62424da9a4bea8809"
+    },
+    {
+      "name": "omnisync_shell.dll",
+      "bytes": 381952,
+      "sha256": "ddc9d47b6fe9f74d7bad21e0adc88b4432726452f2f4501c212f9443b9043ec7"
+    },
+    {
+      "name": "omnisync-setup.exe",
+      "bytes": 695296,
+      "sha256": "08cc307ad1080edaf83e677416d430c8090d68d861ac78266c3a5c218cdb4e3e"
+    },
+    {
+      "name": "installer/releases/OmniSync-Setup-0.1.0-x64.exe",
+      "bytes": 4916247,
+      "sha256": "d5ae8c411613130f7a9ddb9098765907a6fbca7303cf6b322cf5e8560547aed4",
+      "signed": false
+    }
+  ],
+  "buildWarnings": [
+    "MSVC LNK4104 suggests PRIVATE on DllGetClassObject and DllCanUnloadNow exports. The DLL builds and actual exported factories pass the read-only smoke test."
+  ]
+}

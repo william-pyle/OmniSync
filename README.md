@@ -10,11 +10,11 @@ Repository: [william-pyle/OmniSync](https://github.com/william-pyle/OmniSync)
 
 First time connecting Google Drive? Follow the [Google Cloud and sign-in walkthrough](#google-drive-setup) below.
 
-Initial development installer: [OmniSync Setup 0.1.0 x64](installer/releases/OmniSync-Setup-0.1.0-x64.exe) · [SHA-256 checksum](installer/releases/OmniSync-Setup-0.1.0-x64.exe.sha256). This build is unsigned; read the status and release checks below before use.
+Current development installer: [OmniSync Setup 0.1.1 x64](installer/releases/OmniSync-Setup-0.1.1-x64.exe) · [SHA-256 checksum](installer/releases/OmniSync-Setup-0.1.1-x64.exe.sha256). This build is unsigned; read the status and release checks below before use.
 
 ## Status and scope
 
-This is the **0.1.0 development implementation** of the approved OmniSync design. It contains working application and installer source, generated icons, native Windows integration, automated tests and a Windows build workflow. It is not a claim of production certification. The local build is unsigned; Google account integration and machine-wide installation must be exercised in a disposable Windows test environment before relying on it for irreplaceable data.
+This is the **0.1.1 development implementation** of the approved OmniSync design. It contains working application and installer source, generated icons, native Windows integration, automated tests and a Windows build workflow. It is not a claim of production certification. The local build is unsigned; Google account integration and machine-wide installation must be exercised in a disposable Windows test environment before relying on it for irreplaceable data.
 
 See [the verification record](docs/verification.json) for the checks actually performed and the remaining release gates. A compiled installer is not evidence that installation, Google OAuth or Explorer activation has been tested on every supported machine.
 
@@ -28,11 +28,29 @@ See [the verification record](docs/verification.json) for the checks actually pe
 | Explorer | Five COM overlay handlers and three `IExplorerCommand` actions; legacy menu registration included |
 | Slot conflicts | Explicit selection, registration fingerprints, protected recovery receipts, rollback and guarded restoration |
 | Restore | Current and historical file versions, including recovery catalogs from Drive; verify bytes; keep existing destination files |
+| Cleanup | Review excluded files, select their known cloud versions and move them to Google Drive Trash; local files stay intact |
 | Account | One Google account per Windows profile; system-browser desktop OAuth with PKCE and loopback callback |
 | Installation | Windows x64 NSIS setup/uninstall; optional Explorer components; no automatic Explorer restart |
 | Modern menu | Sparse identity package source and packaging script; activation requires the actual publisher's signing identity |
 
 The app deliberately calls its operation **backup**. It does not implement two-way synchronization, cloud placeholders, a virtual drive or automatic propagation of local deletes into Google Drive. “Sync now” means run the backup queue immediately.
+
+## Changes in 0.1.1
+
+- Explorer reads a committed status snapshot during refresh. An independent heartbeat keeps it available during long uploads, and changed paths receive targeted Shell refresh notifications.
+- Explorer badges use a small lower-left footprint. The app and animated tray keep the approved visual identity.
+- Backed-up counts advance at recovery-catalog checkpoints during a batch. Already cataloged files stay counted when another file is pending.
+- Include/exclude reviews open immediately with a calculating indicator. Apply becomes available when the impact is ready, and canceled results stay closed.
+- **Rules > Clean up excluded backups** lets you select and trash known cloud copies of explicitly excluded files. See [cleanup instructions](#clean-up-excluded-cloud-backups).
+
+### Upgrade from 0.1.0
+
+1. Choose **Quit OmniSync** from its tray menu, then run the 0.1.1 installer. Keep the Explorer components enabled if you use them.
+2. Launch OmniSync from the updated Start menu shortcut. Verify **0.1.1** in Settings. Existing folders, rules, account state and local backup records are retained; the sign-in startup entry follows your saved preference and is refreshed to the new executable.
+3. When convenient, save your work and sign out of Windows and back in, or restart **Windows Explorer** yourself from Task Manager. Windows keeps an already loaded overlay DLL and its images in memory; F5 alone cannot load this update. Setup does not restart Explorer for you.
+4. Allow the next backup to publish a recovery catalog. Older records need a one-time catalog coverage update before becoming green; unchanged file bytes are not uploaded again for this migration. Resume backup if it is paused.
+
+The original 0.1.0 installer remains in `installer/releases/` as a historical artifact. Setup uses versioned application directories so an old DLL that Explorer still has open does not block the new payload. Older version directories can remain after an upgrade; use the current Start menu shortcut rather than an old executable.
 
 ## Requirements
 
@@ -89,14 +107,14 @@ The script installs locked npm dependencies, builds the interface, runs Rust tes
 Outputs:
 
 ```text
-out/OmniSync-Setup-0.1.0-x64.exe
-out/OmniSync-Setup-0.1.0-x64.exe.sha256
-out/payload/0.1.0/
+out/OmniSync-Setup-0.1.1-x64.exe
+out/OmniSync-Setup-0.1.1-x64.exe.sha256
+out/payload/0.1.1/
 ```
 
 `out/`, `target/` and `node_modules/` are ignored. Use a GitHub Actions artifact or a deliberately published GitHub release to distribute binaries; do not commit the build cache. The Windows workflow uploads an unsigned development installer on a successful build.
 
-The initial check-in intentionally includes one reviewable installer and its checksum under `installer/releases/`. Later local builds go to `out/`; they do not silently replace that checked-in artifact. The release script embeds the frontend using Tauri's `custom-protocol` feature and remaps local build paths. A release build without the production protocol feature is rejected at compile time.
+Reviewed installers and their checksums are versioned under `installer/releases/`. Local builds go to `out/`; they do not silently replace a checked-in artifact. The release script embeds the frontend using Tauri's `custom-protocol` feature and remaps local build paths. A release build without the production protocol feature is rejected at compile time.
 
 `-SkipTests` is available for a packaging-only rebuild after tests have already passed. It is not the default.
 
@@ -246,7 +264,7 @@ Rules are not silently pre-populated with exclusions. Use the preview and **Acti
 
 ## Backup engine and durability
 
-The engine watches selected roots, debounces notifications and reconciles content. It also performs a periodic full reconciliation. A watcher event immediately invalidates the shared Explorer cache; Explorer will not keep showing a supposedly fresh green badge while the engine is checking changes.
+The engine watches selected roots, debounces notifications and reconciles content. It also performs a periodic full reconciliation. A watcher event immediately changes affected green files and their parent folders to pending while preserving unrelated entries. Unknown changes request a full reconciliation. Access-only events are ignored, and publication preserves changes that arrived after a scan started.
 
 For each changed included file:
 
@@ -257,6 +275,8 @@ For each changed included file:
 5. Send chunks of up to 8 MiB. Save acknowledged offsets. On retry, query the saved session or reconcile the pre-generated target ID before creating a replacement session.
 6. Verify Drive's size and SHA-256, falling back to MD5 when Drive does not supply SHA-256.
 7. Commit the verified version and durable catalog-dirty flag together. Publish a recovery catalog, then reconcile current local bytes before displaying completion.
+
+The queue publishes a catalog after eight completed files, after a completion when five seconds have elapsed, and before starting another large file when completed files are waiting. These are safe checkpoints, not a five-second completion guarantee during a slow cloud request. The Overview polls every 1.5 seconds and counts each current version only after its exact remote ID is covered by a published catalog. A later pending file does not demote already covered versions.
 
 SQLite uses WAL mode and full synchronous writes. Staged files have a default 50 GiB budget and 5 GiB free-space reserve. A file larger than the available staging budget waits with an actionable issue; it is not streamed from a changing source. Failed upload jobs use capped exponential backoff. The upload-rate limit is enforced between chunks, so brief within-chunk bursts are expected.
 
@@ -282,11 +302,27 @@ The app's catalog presents the logical current file and previous versions. The t
 
 Recovery catalogs contain relative paths, root labels, version IDs and checksums. They omit local absolute root paths, OAuth tokens and account credentials. File names and root labels are still personal information; Drive stores them with the backup.
 
-**No automated remote deletion or version pruning is enabled in 0.1.0.** The approved design proposed keeping the current version plus ten prior versions. This build conservatively retains all versions and catalogs; the configuration's `priorVersions` field reserves that policy but does not authorize deletion. Storage usage grows as files change. Perform deliberate cleanup in Google Drive only after verifying another usable copy. Deleting referenced versions can make those versions unavailable to restore.
+**No automatic remote deletion or version pruning is enabled in 0.1.1.** The approved design proposed keeping the current version plus ten prior versions; the configuration's `priorVersions` field reserves that policy. Excluding a file retains its cloud copies by default. The separate reviewed cleanup action below removes only the copies you select. Storage usage otherwise grows as files change.
 
 Upload requests that completed just before a crash can leave a recoverable staged job or an unreferenced remote snapshot. The saved target ID prevents blind duplicate creation for that job. There is no automatic orphan-deletion pass in this release.
 
 Protocol reference: [Google Drive resumable uploads and pre-generated IDs](https://developers.google.com/workspace/drive/api/guides/manage-uploads).
+
+## Clean up excluded cloud backups
+
+1. Save your exclusion rules, or disable a configured source, and review the resulting inclusion/exclusion preview.
+2. Open **Rules > Clean up excluded backups**. The dialog appears immediately while OmniSync finds known cloud versions for explicitly excluded files.
+3. Select individual files or **Select all**. Nothing is selected by default. Each row shows the number and total size of that file's **current and previous cloud copies**.
+4. Choose **Move selected copies to Trash**. OmniSync yields any active backup at its next safe checkpoint, then checks the connected account, exact Drive IDs, ownership, OmniSync device/item tags and stored size/hash before each removal.
+5. Read the result. Successful removals are recorded individually; failed or changed copies remain available for another review. Closing the progress dialog does not cancel an already confirmed cleanup.
+
+**Local files are never deleted by this action.** Cleanup uses Drive's Trash, not permanent deletion or Empty Trash. Google normally deletes trashed files after 30 days, and they still consume storage until permanently deleted. You can inspect or restore them through Google Drive's Trash during that period. [Google Drive trash behavior](https://developers.google.com/workspace/drive/api/guides/delete).
+
+The list is based on this Windows profile's known backup records. It includes explicit exclude rules and disabled configured roots, respecting exact include overrides. Removing a root from configuration, losing access to a source, or encountering a safety exclusion alone does not authorize cleanup. Recovery catalogs, folders, another device's files, modified cloud snapshots and unknown/orphan objects are not automatically removed.
+
+The review expires after ten minutes and must be repeated if configuration or account identity changes. Configuration changes wait until confirmed cleanup finishes. A durable local journal and per-version updates allow a fresh review to retry remaining work after partial failures; already absent or trashed copies are reconciled without another removal.
+
+The next active backup publishes an updated recovery catalog. If backup is paused or automatic backup is off, resume it or use **Sync now** after resuming. Older retained catalogs may still list versions you trashed; those references can no longer restore those copies through OmniSync. Restoring a trashed object in Google Drive does not automatically re-add it to the local version list. Re-including the local file creates a new verified backup if needed.
 
 ## Restore and disaster recovery
 
@@ -316,9 +352,11 @@ The native DLL implements five `IShellIconOverlayIdentifier` COM classes:
 
 Paused, disconnected, metered and authentication conditions also have app/tray text. They do not consume additional Explorer overlay slots. Folder badges summarize known child records. Files outside managed roots have no OmniSync badge.
 
-Explorer never scans a folder or calls Google to determine a badge. It performs a bounded lookup in a per-user shared-memory table of hashed paths and states. The table uses a generation check, has a bounded capacity of 262,144 entries and expires after 15 seconds without a fresh publication. An unavailable, stale or malformed cache returns no badge. The app remains the authoritative detailed status view.
+Explorer calls the overlay handler when it needs status, including a refresh. The handler immediately performs a bounded lookup in a per-user shared-memory table; it never scans a folder or calls Google. Two snapshot banks let it read the last committed table while a new one is being prepared. An independent heartbeat runs every 500 ms, including during uploads, with a 15-second expiry if the engine becomes unavailable. The table supports 262,144 entries. Invalid, stale or unavailable cache data returns no badge.
 
-Right-click actions are **Back up with OmniSync…**, **Exclude from OmniSync…** and **Show OmniSync status**. Include/exclude opens the app's review flow; it does not mutate a configuration from inside Explorer. The initial commands support a single selected file or folder. The standard installer places them in **Show more options** on Windows 11.
+When states change, OmniSync coalesces targeted `SHCNE_UPDATEITEM` notifications so visible Explorer items can be queried again without waiting for F5. Notifications run separately from the heartbeat; long paths use Shell item IDs. The ICO files include transparent padding around small lower-left badges. Explorer still controls scheduling and the limited overlay pool; its cached DLL and images require a reload after an upgrade.
+
+Right-click actions are **Back up with OmniSync…**, **Exclude from OmniSync…** and **Show OmniSync status**. Include/exclude opens the app's review flow immediately with a calculating indicator. Apply stays disabled until the result is ready, and Cancel discards late results. A cold application launch still takes startup time. The command does not mutate a configuration from inside Explorer. The initial commands support a single selected file or folder. The standard installer places them in **Show more options** on Windows 11.
 
 ### Taking slots from another provider
 
@@ -337,7 +375,7 @@ The setup recovery command is:
 
 ```powershell
 # Run in an elevated terminal; substitute the receipt actually saved on your PC.
-& "$env:ProgramFiles\OmniSync\0.1.0\omnisync-setup.exe" restore `
+& "$env:ProgramFiles\OmniSync\0.1.1\omnisync-setup.exe" restore `
   "$env:ProgramData\OmniSync\OverlayBackups\<receipt>.json"
 ```
 
@@ -356,7 +394,7 @@ The NSIS source implements this sequence:
 5. **Install** — copy the versioned payload, apply reviewed integration and register Start menu/Apps & features entries.
 6. **Finish** — launch instructions, account/folder onboarding and recovery-receipt location.
 
-Binaries live under `%ProgramFiles%\OmniSync\0.1.0`. Setup checks whether OmniSync is running and asks you to close it rather than terminating it. It does not auto-launch an elevated backup app after installation.
+Binaries live under `%ProgramFiles%\OmniSync\0.1.1`. Setup checks whether OmniSync is running and asks you to close it rather than terminating it. It does not auto-launch an elevated backup app after installation.
 
 Uninstall removes owned integration and application files. Loaded shell DLLs may be scheduled for deletion at the next restart. The uninstaller does not force a restart and retains source files, cloud backups, per-user state and overlay recovery receipts. Disconnect and disable start-at-sign-in before uninstalling if you want authorization removed and no leftover user startup entry.
 
@@ -427,6 +465,7 @@ Before a public production release, use a dedicated Google test account and a cl
 - OAuth consent, refresh, revocation, account mismatch and testing-mode expiry.
 - Empty, small, Unicode, locked and multi-chunk files; offline/429/5xx recovery; crash after upload but before local/catalog commit; expired resumable sessions; quota exhaustion.
 - Remote edits/removal, rename/move, disconnected roots and rule changes while an upload is in flight.
+- Reviewed Trash cleanup with successful, already-trashed, unowned and changed copies; partial failure, restart and subsequent catalog publication. Automated cleanup tests use scripted responses and never alter a real account.
 - Recovery on a fresh Windows profile, malicious catalog paths, existing restore files and hash mismatch.
 - Administrator/standard-user install, machine-wide ownership, overlay capacity pressure, selected takeover, failure rollback, guarded undo, upgrade and uninstall with a loaded shell DLL.
 - Both Explorer menu paths, package identity/signature, Start menu, sign-in startup, tray lifetime, high DPI, dark/light themes and reduced motion.

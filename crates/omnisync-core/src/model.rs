@@ -130,8 +130,25 @@ pub struct Item {
     pub reason: String,
     pub winning_rule: Option<String>,
     pub current: Option<Version>,
+    /// The current remote version covered by a successfully published recovery catalog.
+    #[serde(default)]
+    pub cataloged_remote_id: Option<String>,
     pub history: Vec<Version>,
     pub last_seen: i64,
+}
+impl Item {
+    pub fn effective_status(&self) -> Status {
+        if self.status == Status::BackedUp
+            && !self
+                .current
+                .as_ref()
+                .is_some_and(|v| self.cataloged_remote_id.as_deref() == Some(&v.remote_id))
+        {
+            Status::Pending
+        } else {
+            self.status
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

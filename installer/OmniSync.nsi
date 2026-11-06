@@ -6,7 +6,7 @@ Unicode true
 !include "WinVer.nsh"
 !include "TextFunc.nsh"
 !ifndef VERSION
-!define VERSION "0.1.0"
+!define VERSION "0.1.1"
 !endif
 !ifndef PAYLOAD
 !error "Pass /DPAYLOAD=<staged files> to makensis"

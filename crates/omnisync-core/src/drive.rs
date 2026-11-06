@@ -10,11 +10,21 @@ pub const CHUNK: usize = 8 * 1024 * 1024;
 const API: &str = "https://www.googleapis.com/drive/v3";
 const UPLOAD: &str = "https://www.googleapis.com/upload/drive/v3";
 const FIELDS: &str =
-    "id,name,size,md5Checksum,sha256Checksum,trashed,mimeType,parents,appProperties,version";
+    "id,name,size,md5Checksum,sha256Checksum,trashed,mimeType,parents,appProperties,version,ownedByMe";
 #[derive(Clone)]
 pub struct Drive {
     http: reqwest::Client,
     auth: Auth,
+    #[cfg(test)]
+    script: Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<TestExchange>>>>,
+}
+#[cfg(test)]
+pub(crate) struct TestExchange {
+    pub method: Method,
+    pub path: String,
+    pub body: Option<Value>,
+    pub status: u16,
+    pub response: Value,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +48,8 @@ pub struct Metadata {
     pub app_properties: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub version: String,
+    #[serde(default)]
+    pub owned_by_me: bool,
 }
 impl Metadata {
     pub fn matches(&self, sha: &str, md5: &str, size: u64) -> bool {
@@ -62,6 +74,8 @@ impl Drive {
     pub fn new(auth: Auth) -> Result<Self> {
         Ok(Self {
             auth,
+            #[cfg(test)]
+            script: None,
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(90))
@@ -70,6 +84,25 @@ impl Drive {
         })
     }
     async fn request(&self, method: Method, url: &str, body: Option<Value>) -> Result<Response> {
+        #[cfg(test)]
+        if let Some(script) = &self.script {
+            let next = script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("Unexpected cloud request");
+            assert_eq!(method, next.method);
+            assert_eq!(
+                url.split('?').next().unwrap(),
+                format!("{API}{}", next.path)
+            );
+            assert_eq!(body, next.body);
+            return Ok(http::Response::builder()
+                .status(next.status)
+                .header("content-type", "application/json")
+                .body(next.response.to_string())?
+                .into());
+        }
         for attempt in 0..2 {
             let token = self.auth.access_token(attempt == 1).await?;
             let mut req = self.http.request(method.clone(), url).bearer_auth(token);
@@ -85,6 +118,16 @@ impl Drive {
             }
         }
         unreachable!()
+    }
+    #[cfg(test)]
+    pub(crate) fn scripted(auth: Auth, exchanges: Vec<TestExchange>) -> Result<Self> {
+        let mut drive = Self::new(auth)?;
+        drive.script = Some(std::sync::Arc::new(std::sync::Mutex::new(exchanges.into())));
+        Ok(drive)
+    }
+    #[cfg(test)]
+    pub(crate) fn assert_script_consumed(&self) {
+        assert!(self.script.as_ref().unwrap().lock().unwrap().is_empty());
     }
     pub async fn about(&self) -> Result<Value> {
         checked(
@@ -132,6 +175,26 @@ impl Drive {
             return Ok(None);
         }
         Ok(Some(checked(res).await?.json().await?))
+    }
+    /// Explicit reviewed cleanup only. Never permanently deletes or empties Trash.
+    pub async fn trash(&self, id: &str) -> Result<()> {
+        valid_id(id)?;
+        let metadata: Metadata = checked(
+            self.request(
+                Method::PATCH,
+                &format!("{API}/files/{id}?fields={FIELDS}"),
+                Some(json!({"trashed":true})),
+            )
+            .await?,
+        )
+        .await?
+        .json()
+        .await?;
+        anyhow::ensure!(
+            metadata.id == id && metadata.trashed,
+            "Google Drive did not confirm moving the selected copy to Trash"
+        );
+        Ok(())
     }
     pub async fn folder(
         &self,

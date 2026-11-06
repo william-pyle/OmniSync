@@ -55,7 +55,24 @@ async fn dispatch(
     };
     match action.as_str() {
         "snapshot" => Ok(serde_json::to_value(engine.snapshot().await?)?),
-        "items" => Ok(serde_json::to_value(engine.items()?)?),
+        "items" => {
+            let engine = engine.clone();
+            Ok(serde_json::to_value(
+                tokio::task::spawn_blocking(move || engine.display_items()).await??,
+            )?)
+        }
+        "previewCleanup" => {
+            let engine = engine.clone();
+            Ok(serde_json::to_value(
+                tokio::task::spawn_blocking(move || engine.preview_cleanup()).await??,
+            )?)
+        }
+        "applyCleanup" => {
+            let selected: Vec<String> = serde_json::from_value(payload["selected"].clone())?;
+            Ok(serde_json::to_value(
+                engine.apply_cleanup(&text("token")?, &selected).await?,
+            )?)
+        }
         "intent" => Ok(json!(state.intent.lock().unwrap().take())),
         "pickRoot" => {
             let file = payload["file"].as_bool().unwrap_or(false);
@@ -95,7 +112,12 @@ async fn dispatch(
             }
             Ok(Value::Null)
         }
-        "undo" => Ok(serde_json::to_value(engine.undo_preview()?)?),
+        "undo" => {
+            let engine = engine.clone();
+            Ok(serde_json::to_value(
+                tokio::task::spawn_blocking(move || engine.undo_preview()).await??,
+            )?)
+        }
         "pause" => {
             engine.pause(Some(payload["seconds"].as_i64().unwrap_or(0)))?;
             Ok(Value::Null)
@@ -272,6 +294,8 @@ fn start() -> Result<()> {
         .setup(move |app| {
             let directory = app.path().app_local_data_dir()?;
             let engine = Engine::open(directory)?;
+            // Refresh the existing user's choice to this version's executable after upgrade.
+            integration::startup(engine.config()?.start_at_sign_in, &std::env::current_exe()?)?;
             app.manage(AppState {
                 engine: engine.clone(),
                 intent: Mutex::new(Some(initial.clone())),

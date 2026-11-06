@@ -17,6 +17,7 @@ impl Store {
         }
         db.execute_batch("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE IF NOT EXISTS configs(revision INTEGER PRIMARY KEY,json TEXT NOT NULL);CREATE TABLE IF NOT EXISTS items(id TEXT PRIMARY KEY,root_id TEXT NOT NULL,path_key TEXT NOT NULL,json TEXT NOT NULL,UNIQUE(root_id,path_key));CREATE TABLE IF NOT EXISTS jobs(item_id TEXT PRIMARY KEY,json TEXT NOT NULL);CREATE TABLE IF NOT EXISTS remote_paths(key TEXT PRIMARY KEY,remote_id TEXT NOT NULL);PRAGMA user_version=1;")?;
         let mut store = Self { db };
+        store.db.execute_batch("CREATE TABLE IF NOT EXISTS cleanup_events(run_id TEXT NOT NULL,remote_id TEXT NOT NULL,item_id TEXT NOT NULL,phase TEXT NOT NULL,updated INTEGER NOT NULL,PRIMARY KEY(run_id,remote_id));")?;
         if store.setting::<Config>("config")?.is_none() {
             store.save_config(&Config::default(), 0)?;
         }
@@ -157,6 +158,79 @@ impl Store {
         )?;
         tx.execute("DELETE FROM jobs WHERE item_id=?", [&item.id])?;
         tx.execute("INSERT INTO settings VALUES('catalogDirty','true') ON CONFLICT(key) DO UPDATE SET value='true'",[])?;
+        tx.commit()?;
+        Ok(())
+    }
+    /// Commit exactly the versions in this durable catalog, including resumed older jobs.
+    pub fn commit_catalog(&mut self, catalog: &Catalog, remote_id: &str, at: i64) -> Result<()> {
+        let covered: std::collections::HashMap<_, _> = catalog
+            .items
+            .iter()
+            .filter_map(|i| {
+                i.current
+                    .as_ref()
+                    .map(|v| (i.id.as_str(), v.remote_id.as_str()))
+            })
+            .collect();
+        let mut items = self.items()?;
+        let mut dirty = false;
+        for item in &mut items {
+            if let Some(version) = &item.current {
+                if covered.get(item.id.as_str()).copied() == Some(version.remote_id.as_str()) {
+                    item.cataloged_remote_id = Some(version.remote_id.clone());
+                }
+                if item.cataloged_remote_id.as_deref() != Some(&version.remote_id) {
+                    dirty = true;
+                }
+            }
+        }
+        let mut account = self.setting::<Account>("account")?.unwrap_or_default();
+        account.catalog_id = Some(remote_id.into());
+        let tx = self.db.transaction()?;
+        for item in items {
+            tx.execute(
+                "UPDATE items SET json=? WHERE id=?",
+                params![serde_json::to_string(&item)?, item.id],
+            )?;
+        }
+        for (key, value) in [
+            ("account", serde_json::to_string(&account)?),
+            ("catalogDirty", serde_json::to_string(&dirty)?),
+            ("catalogJob", "null".into()),
+            ("lastBackup", serde_json::to_string(&at)?),
+        ] {
+            tx.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn record_cleanup(&self, run: &str, item: &str, remote: &str, phase: &str) -> Result<()> {
+        self.db.execute("INSERT INTO cleanup_events VALUES(?,?,?,?,?) ON CONFLICT(run_id,remote_id) DO UPDATE SET phase=excluded.phase,updated=excluded.updated",params![run,remote,item,phase,now()])?;
+        Ok(())
+    }
+    pub fn commit_cleanup(&mut self, run: &str, item_id: &str, remote_id: &str) -> Result<()> {
+        let mut item = self
+            .item(item_id)?
+            .ok_or_else(|| anyhow::anyhow!("Cleanup file record disappeared"))?;
+        item.history.retain(|v| v.remote_id != remote_id);
+        if item
+            .current
+            .as_ref()
+            .is_some_and(|v| v.remote_id == remote_id)
+        {
+            item.current = None;
+            item.cataloged_remote_id = None;
+        }
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "UPDATE items SET json=? WHERE id=?",
+            params![serde_json::to_string(&item)?, item_id],
+        )?;
+        tx.execute("INSERT INTO settings VALUES('catalogDirty','true') ON CONFLICT(key) DO UPDATE SET value='true'",[])?;
+        tx.execute(
+            "UPDATE cleanup_events SET phase='completed',updated=? WHERE run_id=? AND remote_id=?",
+            params![now(), run, remote_id],
+        )?;
         tx.commit()?;
         Ok(())
     }

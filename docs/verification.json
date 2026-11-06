@@ -1,13 +1,14 @@
 {
-  "version": "0.1.0",
-  "status": "Initial development build and local checks completed; external release gates remain",
+  "version": "0.1.1",
+  "status": "0.1.1 unsigned installer built and locally verified; installed upgrade and live Google tests remain external gates",
   "checks": [
     {
       "name": "Rust workspace tests",
       "result": "passed",
-      "tests": 24,
-      "coreTests": 17,
-      "windowsTests": 7
+      "tests": 32,
+      "coreTests": 23,
+      "windowsTests": 9,
+      "scope": "Includes double-buffer cache readers, heartbeat expiry, pending-path races, catalog coverage and counts, stale cleanup reviews, per-version persistence and scripted Drive partial failure/retry. No live Google calls."
     },
     {
       "name": "TypeScript strict typecheck and Vite production bundle",
@@ -16,55 +17,57 @@
     {
       "name": "Edge interface tests",
       "result": "passed",
-      "tests": 10,
-      "scope": "Explicit mock IPC fixture; seven screens, pause/resume, configuration preview, animation and reduced motion, dark/light at 390/768/1440 pixels. Does not assert live native or Google behavior."
+      "tests": 17,
+      "scope": "Explicit mock IPC. Seven screens, pause/resume, animation/reduced motion, metric polling, immediate calculation dialog and cancellation, selected Trash action, dark/light responsive layout including cleanup review."
     },
     {
-      "name": "Release production protocol and bundled assets",
+      "name": "Overlay ICO native frame inspection",
       "result": "passed",
-      "detail": "All native binaries compiled with static CRT and remapped build paths. Tauri custom-protocol enabled; compile guard rejects a release without it."
+      "frames": 63,
+      "sizes": [
+        16,
+        20,
+        24,
+        32,
+        40,
+        48,
+        64,
+        128,
+        256
+      ],
+      "scope": "Decoded actual ICO alpha bounds remain in lower-left extent (half canvas at small sizes, three-eighths at larger sizes, allowing a one-pixel antialias edge). Visually inspected enlarged composites on illustrative folders; not an installed Explorer screenshot."
     },
     {
-      "name": "Compiled Explorer DLL smoke test",
+      "name": "Release build, compiled COM smoke and NSIS packaging",
       "result": "passed",
-      "detail": "Five overlay factories and three context commands instantiated, icon resources checked, unmanaged-path suppression and COM lifetime verified; no registration or command invocation."
-    },
-    {
-      "name": "Read-only Explorer inventory",
-      "result": "passed",
-      "registrations": 5,
-      "eligibleRegistrations": 4
-    },
-    {
-      "name": "NSIS installer compilation",
-      "result": "passed",
-      "installPages": 6,
-      "warnings": 0
+      "scope": "Production custom-protocol release; static CRT; staged DLL five overlay and three context factories/icon paths/unmanaged status/COM lifetime verified without registration. Six-page NSIS installer compiled; zero NSIS warnings."
     },
     {
       "name": "Source and artifact review",
       "result": "passed",
-      "detail": "No embedded credentials, private runtime files or personal build path prefixes detected in the reviewed source/binaries; npm audit reported zero vulnerabilities."
+      "scope": "Source audit and Git diff review; raw UTF-8/UTF-16 build path prefix checks on binaries; SHA-256 verified; original 0.1.0 artifact unchanged; production npm audit reports zero vulnerabilities."
     },
     {
-      "name": "Native desktop visual interaction",
-      "result": "not completed",
-      "detail": "Computer-use native pipe unavailable on three attempts including runtime reset (Windows os error 2). Browser tests and COM smoke test do not replace native visual verification."
+      "name": "Installed upgrade and live Google Trash",
+      "result": "not exercised",
+      "scope": "Preserved the active installed app, Explorer, account and cloud files. Scripted transport tests do not replace a dedicated test-account run."
     }
   ],
   "externalReleaseGates": [
-    "Native desktop visual interaction, tray behavior and system-browser sign-in on a functioning desktop test environment",
-    "Live Google OAuth, uploads, session recovery and fresh-profile restore with a dedicated test account",
-    "Administrator and standard-user install/uninstall, overlay takeover and failure rollback in a clean Windows VM",
-    "Production signing, Google consent branding and trusted sparse-package identity activation",
-    "Adversarial filesystem races, large-tree scaling and dependency/license review before production distribution"
+    "Install 0.1.1 and explicitly reload Explorer; verify native F5 behavior, lower-left badges at real DPI, context review timing and tray status",
+    "Dedicated Google test account: real OAuth, upload/checkpoint progress, reviewed Trash and partial failures, then recovery from the updated catalog",
+    "Clean Windows VM administrator and standard-user install/upgrade/uninstall, overlay takeover and rollback",
+    "Production signing, Google consent branding, trusted sparse package lifecycle and dependency/license review",
+    "Adversarial filesystem races and large-tree performance before production distribution"
   ],
-  "sideEffects": {
-    "personalGoogleAccountConnected": false,
-    "applicationInstalledOnDevelopmentMachine": false,
+  "developmentActions": {
+    "personalGoogleAccountUsed": false,
+    "installedApplicationStopped": false,
+    "updateInstalled": false,
+    "explorerRestarted": false,
     "productionExplorerRegistrationsChanged": false
   },
-  "checkedAt": "2026-11-06T02:37:51.290146+00:00",
+  "checkedAt": "2026-11-06T05:01:25.288717+00:00",
   "environment": {
     "os": "Windows x64",
     "rust": "1.98.1",
@@ -72,30 +75,34 @@
     "nsis": "3.11 Unicode",
     "browser": "Microsoft Edge headless"
   },
-  "artifacts": [
-    {
-      "name": "omnisync.exe",
-      "bytes": 16280576,
-      "sha256": "d68dff56597ddc8e75c375b231fa2872449af26c4f2d04d62424da9a4bea8809"
-    },
-    {
-      "name": "omnisync_shell.dll",
-      "bytes": 381952,
-      "sha256": "ddc9d47b6fe9f74d7bad21e0adc88b4432726452f2f4501c212f9443b9043ec7"
-    },
-    {
-      "name": "omnisync-setup.exe",
-      "bytes": 695296,
-      "sha256": "08cc307ad1080edaf83e677416d430c8090d68d861ac78266c3a5c218cdb4e3e"
-    },
-    {
-      "name": "installer/releases/OmniSync-Setup-0.1.0-x64.exe",
-      "bytes": 4916247,
-      "sha256": "d5ae8c411613130f7a9ddb9098765907a6fbca7303cf6b322cf5e8560547aed4",
-      "signed": false
-    }
-  ],
   "buildWarnings": [
     "MSVC LNK4104 suggests PRIVATE on DllGetClassObject and DllCanUnloadNow exports. The DLL builds and actual exported factories pass the read-only smoke test."
+  ],
+  "previousVerification": "verification-0.1.0.json",
+  "artifacts": [
+    {
+      "name": "out/payload/0.1.1/omnisync.exe",
+      "bytes": 16612864,
+      "sha256": "67fbb92ccc4bfe912b466d04c8e2b666aaad010e7911138ff75cd6bde70690b9",
+      "signed": false
+    },
+    {
+      "name": "out/payload/0.1.1/omnisync_shell.dll",
+      "bytes": 388096,
+      "sha256": "9173c495c4cf6ff46932cc369dafecef4c220586c5290ed1dd40694dd33ad9a3",
+      "signed": false
+    },
+    {
+      "name": "out/payload/0.1.1/omnisync-setup.exe",
+      "bytes": 695296,
+      "sha256": "a4eafd9d6a6eec855786263587d0c14dc8c7e798160a178d2bf1b8bc0aa8da0e",
+      "signed": false
+    },
+    {
+      "name": "installer/releases/OmniSync-Setup-0.1.1-x64.exe",
+      "bytes": 4957543,
+      "sha256": "aedba1e7e7a9dc1ca0adab0bcf3c5e8c746ce6758989fa2b2bd392c699c98f0f",
+      "signed": false
+    }
   ]
 }

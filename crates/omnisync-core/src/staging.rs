@@ -165,6 +165,7 @@ mod tests {
             reason: String::new(),
             winning_rule: None,
             current: None,
+            cataloged_remote_id: None,
             history: vec![],
             last_seen: 0,
         };
