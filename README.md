@@ -8,6 +8,8 @@ OmniSync is a Windows desktop backup application written primarily in Rust. It b
 
 Repository: [william-pyle/OmniSync](https://github.com/william-pyle/OmniSync)
 
+First time connecting Google Drive? Follow the [Google Cloud and sign-in walkthrough](#google-drive-setup) below.
+
 Initial development installer: [OmniSync Setup 0.1.0 x64](installer/releases/OmniSync-Setup-0.1.0-x64.exe) · [SHA-256 checksum](installer/releases/OmniSync-Setup-0.1.0-x64.exe.sha256). This build is unsigned; read the status and release checks below before use.
 
 ## Status and scope
@@ -100,12 +102,88 @@ The initial check-in intentionally includes one reviewable installer and its che
 
 ## Google Drive setup
 
-1. Create or select your Google Cloud project and enable **Google Drive API**.
-2. Configure the OAuth consent screen. For a development project in testing mode, add your Google account as a test user. Follow Google's current publishing requirements for distribution to other people.
-3. Create an OAuth client of type **Desktop app**. Download its JSON outside this repository.
-4. In OmniSync, open **Settings → Import desktop OAuth JSON**. The importer expects the Google JSON's `installed` section. It rejects a web-client JSON.
-5. Choose **Connect**. Complete consent in the system browser. The redirect is an ephemeral `127.0.0.1` loopback listener with a random state value and PKCE verifier. The listener times out after five minutes.
-6. Add a folder, review the inclusion counts and apply. The app will create its own visible backup folders in your Drive.
+This development build requires you to create a Google OAuth **Desktop app** client once, download its JSON configuration, and import that file into OmniSync. A Google Cloud project holds the API settings and client identity; your backed-up files still go to your Google Drive. You do not need to write code or deploy a server for these steps.
+
+The walkthrough uses Google's console terminology checked on November 5, 2026. Keep the **same project selected** throughout. A personal Gmail account normally uses the **External** audience; a managed work/school account may require its administrator's approval.
+
+### 1. Create or select the Google Cloud project
+
+1. Open [Google Cloud Console](https://console.cloud.google.com/) and sign in. For a personal setup, using the account whose Drive you will back up to keeps account selection straightforward.
+2. Click the **project selector** near the top-left, beside the Google Cloud logo. It may say **Select a project** or show an existing project's name.
+3. To reuse a project, select it. Otherwise choose **New project**, or open the [Create a project page](https://console.cloud.google.com/projectcreate) directly.
+4. Enter **OmniSync Personal** as the project name. The generated project ID is fine. For a personal account, use **No organization** if that choice is shown; work accounts may require an organization/location.
+5. Click **Create**, wait for completion, then use the project selector to select **OmniSync Personal**. Confirm that its name is displayed in the top bar before continuing.
+
+Google's reference: [Create a Google Cloud project](https://developers.google.com/workspace/guides/create-project).
+
+### 2. Enable Google Drive API
+
+1. With your OmniSync project selected, open **☰ → APIs & Services → Library**. You can also open the [Google Drive API library page](https://console.cloud.google.com/apis/library/drive.googleapis.com) directly.
+2. If using the Library search, enter **Google Drive API** and select that exact result. **Google Drive Activity API** is a different service.
+3. Click **Enable** and wait. If the page already shows **Manage** or **API enabled**, it is already enabled for the selected project.
+4. Confirm that **Google Drive API** appears under **APIs & Services → Enabled APIs & services**.
+
+That completes the step to "create or select your Google Cloud project and enable Google Drive API." Continue below to create the sign-in configuration OmniSync needs. See Google's [API enablement instructions](https://developers.google.com/workspace/guides/enable-apis).
+
+Google currently describes standard Drive API usage as available at no additional cost, with quota/billing changes planned for higher usage. Drive storage capacity is separate. Check the current [Drive API usage and pricing page](https://developers.google.com/workspace/drive/api/guides/limits#pricing) before enabling paid services or requesting higher quotas.
+
+### 3. Set up the consent screen and your test account
+
+1. Open **☰ → Google Auth platform → Branding**, or the [Branding page](https://console.cloud.google.com/auth/branding). If prompted, click **Get started**.
+2. Set the app name to **OmniSync Personal**, choose your support email, and continue.
+3. For personal Gmail, choose **External** as the audience. **Internal** is for an eligible Google Workspace organization.
+4. Supply your contact email. Read the policy, accept it if you agree, and finish creating the configuration.
+5. Open **Google Auth platform → Audience**. Keep **Testing** for the initial connection check.
+6. Under **Test users**, click **Add users**, enter the exact Google email you will select when signing into OmniSync, and save.
+
+Existing configurations can be edited in Branding and Audience. Older instructions may call this area **OAuth consent screen**. Google's [consent configuration guide](https://developers.google.com/workspace/guides/configure-oauth-consent) covers the current flow.
+
+### 4. Add OmniSync's Drive permission
+
+In **Google Auth platform → Data Access**, choose **Add or remove scopes**. Find/select the scope below, or enter it in the manual scope field if offered, then update and save:
+
+```text
+https://www.googleapis.com/auth/drive.file
+```
+
+This matches OmniSync's implemented permission request and grants access to app-created or explicitly authorized files. Broad `drive` access is unnecessary for this build. Google classifies `drive.file` as non-sensitive. See [Drive API scopes](https://developers.google.com/workspace/drive/api/guides/api-specific-auth).
+
+### 5. Create and download the Desktop app client
+
+1. Open **Google Auth platform → Clients**, or the [Clients page](https://console.cloud.google.com/auth/clients).
+2. Choose **Create client** and set **Application type** to **Desktop app**.
+3. Name it **OmniSync Windows**, then click **Create**. If an optional AI-agent checkbox appears, leave it unchecked; OmniSync is a desktop backup client.
+4. Download the client JSON using **Download JSON** in the creation dialog or the download control associated with that client. Save it outside the Git repository, such as in your Downloads folder. Keep a private recovery copy of this configuration.
+
+OmniSync imports the whole downloaded JSON file; you do not need to paste a client ID into its source. It expects an `installed` section. A **Web application**, API key or service-account JSON will not work with its importer. Desktop sign-in uses a local loopback callback; you do not configure web origins or a hosted redirect URL.
+
+References: [Create a Desktop app client](https://developers.google.com/workspace/guides/create-credentials#desktop-app), [Google's desktop JSON setup example](https://developers.google.com/workspace/drive/api/quickstart/python#authorize_credentials_for_a_desktop_application), [Desktop OAuth and loopback redirects](https://developers.google.com/identity/protocols/oauth2/native-app).
+
+### 6. Import the file and connect OmniSync
+
+1. Open the installed OmniSync application and select **Settings**.
+2. Click **Import desktop OAuth JSON** and select the file downloaded in step 5. A successful import enables **Connect**.
+3. Click **Connect**. In your system browser, choose the account added under Test users and approve the requested Drive permission. Complete the flow within five minutes; otherwise click Connect again.
+4. Return to OmniSync. Settings should show the account and the sidebar should say **Connected to Google Drive**. The browser callback alone is not proof that connection succeeded.
+5. Add a small disposable test folder, review and apply its selection, then run **Sync now**. Resume first if paused. Check its uploaded files in Drive and test restoring one before selecting important folders.
+
+The app creates its own visible backup folders in Drive. It does not require an existing cloud folder to be shared with a service account.
+
+### Testing mode and common setup problems
+
+For an External OAuth app left in **Testing**, Google's refresh token expires after **seven days** when requesting Drive access. Reconnect when that happens. For ongoing use, review **Audience → Publishing status** and Google's requirements for moving to **In production**; reconnect afterward to obtain a fresh authorization. Google's publishing status concerns OAuth access, not the production readiness of this OmniSync development build. See [refresh-token expiration](https://developers.google.com/identity/protocols/oauth2#expiration) and [Google Auth platform guidance](https://support.google.com/cloud/answer/15544987).
+
+| Problem | What to check |
+| --- | --- |
+| Cannot create a project or enable the API | Confirm the signed-in account and selected project; a managed account may need its administrator to grant access |
+| Google says the app is in testing or access is denied | Add the exact sign-in email under **Audience → Test users** in the project that owns the downloaded client |
+| API is disabled / `accessNotConfigured` | Enable **Google Drive API** in the same project as that client |
+| Import rejects the JSON | Download a **Desktop app** client JSON; do not use an API key, web client or service-account key |
+| Sign-in reports `redirect_uri_mismatch` | Recheck that the imported client is **Desktop app**; do not add guessed redirect URLs to a web client |
+| Access stops after about a week | Check the External/Testing token-expiration rule above and reconnect |
+| Work/school account blocks consent | Ask the organization's administrator to review the app's requested access |
+
+### Account access and storage
 
 The requested scope is `https://www.googleapis.com/auth/drive.file`. This limits access to files created or authorized for this OAuth application. OmniSync does not adopt Google Drive for desktop's existing **Computers** backup tree. Changing OAuth client projects can also change which existing recovery catalogs are visible.
 
