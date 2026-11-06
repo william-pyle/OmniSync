@@ -1,0 +1,15 @@
+{
+  "cases":[
+    {"path":"draft.tmp","expected":"exclude","winningRule":"rule-temp"},
+    {"path":"nested/DRAFT.TMP","expected":"exclude","winningRule":"rule-temp"},
+    {"path":"node_modules/package.json","expected":"exclude","winningRule":"rule-cache"},
+    {"path":"Project/node_modules/package.json","expected":"exclude","winningRule":"rule-cache"},
+    {"path":"Private/note.txt","expected":"exclude","winningRule":"rule-private"},
+    {"path":"Private/keep.txt","expected":"include","winningRule":"rule-keep"},
+    {"path":"Private-ish/note.txt","expected":"include","winningRule":null},
+    {"path":"Résumé/notes.txt","expected":"include","winningRule":null},
+    {"path":".hidden","expected":"include","winningRule":null},
+    {"path":"../outside.txt","expected":"reject","winningRule":null}
+  ],
+  "aiTracking":{"purpose":"Acceptance fixtures for the future Rust matcher against config.example.json; not a claim that the native engine exists."}
+}

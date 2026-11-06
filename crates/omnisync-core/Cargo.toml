@@ -1,0 +1,31 @@
+[package]
+name = "omnisync-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+windows.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+omnisync-windows = { path = "../omnisync-windows" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+globset = "0.4.21"
+notify = "8"
+walkdir = "2"
+md-5 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+url = "2"
+dirs = "6"
+futures-util = "0.3"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

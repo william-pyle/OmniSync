@@ -1,0 +1,42 @@
+name: Windows build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
+      - name: Select Rust toolchain
+        shell: pwsh
+        run: rustup default 1.98.1
+      - name: Install NSIS
+        shell: pwsh
+        run: choco install nsis --no-progress -y
+      - name: Build and test installer
+        shell: pwsh
+        run: ./scripts/build.ps1
+      - name: Audit source package
+        shell: pwsh
+        run: npm run audit:source
+      - name: Interface tests in Edge
+        shell: pwsh
+        run: npm run test:ui
+      - name: Upload unsigned development installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniSync-Windows-x64-unsigned
+          path: |
+            out/OmniSync-Setup-*-x64.exe
+            out/OmniSync-Setup-*-x64.exe.sha256
+          if-no-files-found: error

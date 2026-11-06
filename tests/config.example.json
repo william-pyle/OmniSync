@@ -1,0 +1,17 @@
+{
+  "schemaVersion":1,
+  "revision":1,
+  "accountRef":"account-example",
+  "mode":"backup",
+  "roots":[{"id":"root-documents","kind":"folder","path":"C:/Users/Example/Documents","volumeIdentity":"example-volume-guid","enabled":true}],
+  "rules":[
+    {"id":"rule-temp","scope":"global","kind":"filenameGlob","action":"exclude","value":"*.tmp","order":1},
+    {"id":"rule-cache","scope":"root-documents","kind":"pathGlob","action":"exclude","value":"**/node_modules/**","order":2},
+    {"id":"rule-private","scope":"root-documents","kind":"subtree","action":"exclude","value":"Private","order":3},
+    {"id":"rule-keep","scope":"root-documents","kind":"exactFile","action":"include","value":"Private/keep.txt","order":4}
+  ],
+  "schedule":{"mode":"continuous","pauseUntil":null,"pauseOnMetered":true,"uploadLimitKiBps":null},
+  "retention":{"localDeletion":"keepUntilExplicitCleanup","exclusion":"keepUntilExplicitCleanup","priorVersions":10},
+  "engine":{"uploadConcurrency":2,"chunkBytes":8388608,"stagingBudgetGiB":50,"freeSpaceReserveGiB":5},
+  "integration":{"startAtSignIn":true,"closeToTray":true,"explorerCommands":true,"overlays":true,"takeoverPolicy":"explicitReviewedTransactionOnly"}
+}

@@ -1,0 +1,58 @@
+{
+  "name": "OmniSync Mobius",
+  "dark": {
+    "canvas": "#0B1020",
+    "surface": "#131C30",
+    "raised": "#1A2640",
+    "border": "#2D3B56",
+    "text": "#EEF3FF",
+    "muted": "#A6B4CD",
+    "accent": "#F28B42",
+    "secondary": "#C99575",
+    "success": "#45D6A3",
+    "pending": "#F1C66B",
+    "issue": "#FF889A",
+    "excluded": "#A7B2C5"
+  },
+  "light": {
+    "canvas": "#F4F7FC",
+    "surface": "#FFFFFF",
+    "raised": "#E9EFF8",
+    "border": "#C9D4E6",
+    "text": "#17233B",
+    "muted": "#53647C",
+    "accent": "#B64900",
+    "secondary": "#875235",
+    "success": "#087F5B",
+    "pending": "#8B5C00",
+    "issue": "#B52846",
+    "excluded": "#53647C"
+  },
+  "typography": {
+    "family": "Segoe UI Variable, Segoe UI, system-ui, sans-serif",
+    "bodyPx": 14,
+    "smallPx": 12,
+    "headingPx": 28
+  },
+  "motion": {
+    "transitionMs": 160,
+    "trayMaxFps": 4,
+    "reducedMotion": "Static Mobius loop with state text and numeric progress",
+    "syncFlowMs": 3000,
+    "trayFrames": 24,
+    "syncRotationMs": 6000,
+    "trayRotationFrames": 24
+  },
+  "radii": {
+    "control": 8,
+    "panel": 14,
+    "badge": 99
+  },
+  "brand": {
+    "revision": "mobius-burnt-orange-v1",
+    "markPath": "assets/omnisync.svg",
+    "baseColor": "#CC5500",
+    "highlight": "#F28B42",
+    "status": "User-approved design"
+  }
+}

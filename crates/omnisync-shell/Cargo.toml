@@ -1,0 +1,13 @@
+[package]
+name = "omnisync-shell"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+omnisync-windows = { path = "../omnisync-windows" }
+windows.workspace = true
+windows-core = "=0.61.2"

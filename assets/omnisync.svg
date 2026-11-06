@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <filter id="mobius-glow" x="-50%" y="-50%" width="200%" height="200%" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="1.7"/></filter>
+    <linearGradient id="mobius-base" x1="12" y1="42" x2="52" y2="20" gradientUnits="userSpaceOnUse"><stop stop-color="#8D3500"/><stop offset=".45" stop-color="#CC5500"/><stop offset="1" stop-color="#A54000"/></linearGradient>
+    <linearGradient id="mobius-back" x1="13" y1="28" x2="44" y2="9" gradientUnits="userSpaceOnUse"><stop stop-color="#BC4800"/><stop offset=".48" stop-color="#F28B42"/><stop offset="1" stop-color="#CC5500"/></linearGradient>
+    <linearGradient id="mobius-front" x1="13" y1="52" x2="48" y2="39" gradientUnits="userSpaceOnUse"><stop stop-color="#B34500"/><stop offset=".48" stop-color="#CC5500"/><stop offset=".8" stop-color="#F28B42"/><stop offset="1" stop-color="#DF6819"/></linearGradient>
+    <clipPath id="mobius-clip"><path fill-rule="evenodd" clip-rule="evenodd" d="M31.5 6C18 6 7.6 17.6 6.5 32.5C5 44.9 14.7 57.5 31 58C46.5 58.5 58 47 58 34C58 20 47 6 31.5 6ZM31.5 14C43 14 51 23 49 33C48 38 41 40 32 44L25 47C18 44 13.5 39 14 32.5C14.5 22 21.5 14 31.5 14Z"/></clipPath>
+  </defs>
+  <g clip-path="url(#mobius-clip)">
+    <path d="M4 4H60V60H4Z" fill="url(#mobius-base)"/>
+    <path d="M6.5 32.5C7.6 17.6 18 6 31.5 6C43.5 6 53.5 17 56 28C49 17 38 12.5 29 14C17 16 8 25 6.5 32.5Z" fill="url(#mobius-back)"/>
+    <path d="M6.5 32.5C4.5 43 10.5 51.2 20 50C32 48.5 48.5 40 53 31C55.5 26 54 22 52 19C57 25 59 32 58 39C56.5 51 42 58.5 31 58C15 57 5 46.5 6.5 32.5Z" fill="url(#mobius-front)"/>
+    <path d="M9 46C18 59 48 39 53 31" stroke="#FFB777" stroke-opacity=".35" stroke-width=".5"/>
+    <path class="mobius-flow" d="M31.5 10C44 10 54 22 54 34C54 45 42 54 31 54C18 54 10 43 10 32C10 20 20 10 31.5 10Z" pathLength="100" stroke="#FFE0BA" stroke-width="10" stroke-linecap="round" stroke-dasharray="8 92" opacity="0" filter="url(#mobius-glow)"/>
+  </g>
+</svg>

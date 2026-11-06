@@ -1,0 +1,35 @@
+{
+  "name": "omnisync",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "build": "tsc --noEmit && vite build",
+    "icons": "node scripts/generate-icons.mjs",
+    "tauri": "tauri",
+    "desktop": "tauri dev",
+    "test": "cargo test --workspace",
+    "check": "tsc --noEmit && cargo check --workspace",
+    "installer": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1",
+    "audit:source": "node scripts/check-source.mjs",
+    "test:ui": "playwright test"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.0",
+    "@resvg/resvg-js": "2.6.2",
+    "@tauri-apps/cli": "2.12.4",
+    "typescript": "7.0.2",
+    "vite": "8.3.6"
+  },
+  "engines": {
+    "node": ">=22.12"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/william-pyle/OmniSync.git"
+  }
+}
