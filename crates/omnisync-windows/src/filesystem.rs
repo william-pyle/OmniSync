@@ -14,13 +14,15 @@ use windows::{
 };
 
 pub fn display(path: &Path) -> String {
-    path.to_string_lossy()
-        .trim_start_matches(r"\\?\")
-        .to_string()
+    let value = path.to_string_lossy();
+    if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        value.trim_start_matches(r"\\?\").to_string()
+    }
 }
 pub fn key(path: &Path) -> String {
-    path.to_string_lossy()
-        .trim_start_matches(r"\\?\")
+    display(path)
         .replace('/', "\\")
         .trim_end_matches('\\')
         .to_uppercase()
@@ -210,6 +212,9 @@ pub fn guarded_directories(path: &Path) -> Result<Vec<File>> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component);
+        if matches!(component, std::path::Component::Prefix(_)) {
+            continue;
+        }
         if !current.has_root() {
             continue;
         }
@@ -217,10 +222,11 @@ pub fn guarded_directories(path: &Path) -> Result<Vec<File>> {
             std::fs::create_dir(&current)?;
         }
         let file = OpenOptions::new()
-            .read(true)
+            .access_mode(FILE_READ_ATTRIBUTES.0)
             .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
-            .open(&current)?;
+            .open(&current)
+            .with_context(|| format!("Cannot protect restore directory {}", display(&current)))?;
         let metadata = file.metadata()?;
         anyhow::ensure!(
             metadata.is_dir() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0,

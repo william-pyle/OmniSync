@@ -1,19 +1,11 @@
-use crate::{
-    drive::{Drive, UploadReply, CHUNK},
-    model::*,
-    oauth::Auth,
-    rules::Matcher,
-    staging,
-    store::Store,
-};
-use anyhow::{bail, Context, Result};
+use crate::{folder, model::*, rules::Matcher, staging, store::Store};
+use anyhow::{Context, Result};
 use notify::Watcher;
 use omnisync_windows::{filesystem, security, status::Cache};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -27,7 +19,6 @@ struct PendingPreview {
     expires: i64,
     paths: Vec<(String, String)>,
 }
-mod cleanup;
 struct StatusService {
     task: tokio::task::JoinHandle<()>,
     cache: Arc<Cache>,
@@ -41,17 +32,14 @@ impl Drop for StatusService {
 pub struct Engine {
     pub state: PathBuf,
     store: Mutex<Store>,
-    pub auth: Auth,
-    drive: Drive,
     progress: Mutex<Progress>,
     summary: Mutex<Counts>,
     previews: Mutex<HashMap<String, PendingPreview>>,
-    cleanup_previews: Mutex<HashMap<String, cleanup::CleanupPlan>>,
-    cleanup_running: AtomicBool,
     wake: tokio::sync::Notify,
     dirty: AtomicBool,
     force: AtomicBool,
     stopping: AtomicBool,
+    applying: AtomicBool,
     cache: Arc<Cache>,
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
     watched: Mutex<Vec<String>>,
@@ -74,14 +62,10 @@ impl Engine {
         }) {
             store.set("catalogDirty", &true)?;
         }
-        let last_backup = store.setting::<i64>("lastBackup")?;
-        let auth = Auth::new(&state)?;
-        let drive = Drive::new(auth.clone())?;
+        let last_backup = store.setting::<Option<i64>>("lastBackup")?.flatten();
         Ok(Arc::new(Self {
             state,
             store: Mutex::new(store),
-            auth,
-            drive,
             progress: Mutex::new(Progress {
                 phase: "starting".into(),
                 last_backup,
@@ -89,12 +73,11 @@ impl Engine {
             }),
             summary: Mutex::new(Counts::default()),
             previews: Mutex::new(HashMap::new()),
-            cleanup_previews: Mutex::new(HashMap::new()),
-            cleanup_running: AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
             dirty: AtomicBool::new(true),
             force: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
+            applying: AtomicBool::new(false),
             cache: Arc::new(cache),
             watcher: Mutex::new(None),
             watched: Mutex::new(vec![]),
@@ -108,24 +91,12 @@ impl Engine {
     pub fn items(&self) -> Result<Vec<Item>> {
         self.store.lock().unwrap().items()
     }
-    fn account(&self) -> Result<Account> {
-        Ok(self
-            .store
-            .lock()
-            .unwrap()
-            .setting("account")?
-            .unwrap_or_default())
-    }
     pub async fn snapshot(self: &Arc<Self>) -> Result<Snapshot> {
-        let connected = self.auth.connected().await;
-        let configured = self.auth.configured().await;
         let engine = self.clone();
-        tokio::task::spawn_blocking(move || engine.snapshot_local(connected, configured)).await?
+        tokio::task::spawn_blocking(move || engine.snapshot_local()).await?
     }
-    fn snapshot_local(&self, connected: bool, oauth_configured: bool) -> Result<Snapshot> {
+    fn snapshot_local(&self) -> Result<Snapshot> {
         let config = self.config()?;
-        let mut account = self.account()?;
-        account.connected = connected;
         let mut recent = self.display_items()?;
         let mut counts = Counts::default();
         for item in &recent {
@@ -143,15 +114,13 @@ impl Engine {
         let mut progress = self.progress.lock().unwrap().clone();
         if config.paused() {
             progress.phase = "paused".into();
-            progress.message = "Backup is paused. Existing cloud copies are retained.".into();
+            progress.message = "Backup is paused. Existing backup copies are retained.".into();
         }
         Ok(Snapshot {
             config,
-            account,
             progress,
             counts,
             recent,
-            oauth_configured,
             version: env!("CARGO_PKG_VERSION").into(),
         })
     }
@@ -195,10 +164,6 @@ impl Engine {
     }
     pub fn pause(&self, seconds: Option<i64>) -> Result<()> {
         let mut s = self.store.lock().unwrap();
-        anyhow::ensure!(
-            !self.cleanup_running.load(Ordering::SeqCst),
-            "Wait for cloud cleanup to finish before changing backup preferences"
-        );
         let mut c = s.config()?;
         let expected = c.revision;
         c.revision += 1;
@@ -213,10 +178,14 @@ impl Engine {
         self.cache.invalidate();
         self.wake.notify_one();
     }
+    pub async fn stop_when_idle(&self) {
+        self.shutdown();
+        let _guard = self.run_lock.lock().await;
+    }
     fn permitted(&self) -> Result<()> {
         anyhow::ensure!(
-            !self.cleanup_running.load(Ordering::SeqCst),
-            "Backup is yielding at a checkpoint for cloud cleanup"
+            !self.applying.load(Ordering::SeqCst),
+            "Applying reviewed settings at a safe checkpoint"
         );
         anyhow::ensure!(
             !self.dirty.load(Ordering::SeqCst),
@@ -227,63 +196,6 @@ impl Engine {
             !self.config()?.paused(),
             "Backup paused at a safe checkpoint"
         );
-        Ok(())
-    }
-    pub async fn connect(&self) -> Result<()> {
-        if self.progress.lock().unwrap().connecting {
-            bail!("Sign-in is already open in your browser");
-        }
-        self.progress.lock().unwrap().connecting = true;
-        let result = async {
-            self.auth.connect().await?;
-            self.refresh_account().await?;
-            self.rescan();
-            Ok(())
-        }
-        .await;
-        self.progress.lock().unwrap().connecting = false;
-        result
-    }
-    pub async fn disconnect(&self) -> Result<()> {
-        self.pause(Some(0))?;
-        let _guard = self.run_lock.lock().await;
-        self.auth.disconnect().await?;
-        self.phase(
-            "disconnected",
-            "Google Drive is disconnected. Cloud backups are retained.",
-        );
-        Ok(())
-    }
-    async fn refresh_account(&self) -> Result<()> {
-        let v = self.drive.about().await?;
-        let mut account = self.account()?;
-        let permission = v["user"]["permissionId"]
-            .as_str()
-            .context("Drive account identity is missing")?
-            .to_string();
-        if !account.permission_id.is_empty() && account.permission_id != permission {
-            self.auth.disconnect().await?;
-            bail!("This profile belongs to another Google account. Reconnect the original account; use a separate Windows user for a separate profile.");
-        }
-        account.permission_id = permission;
-        account.display_name = v["user"]["displayName"]
-            .as_str()
-            .unwrap_or("Google Drive")
-            .into();
-        account.email = v["user"]["emailAddress"]
-            .as_str()
-            .unwrap_or_default()
-            .into();
-        account.connected = true;
-        account.quota_used = v["storageQuota"]["usage"]
-            .as_str()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        account.quota_limit = v["storageQuota"]["limit"]
-            .as_str()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        self.store.lock().unwrap().set("account", &account)?;
         Ok(())
     }
     pub fn preview(&self, mut config: Config, description: String) -> Result<Preview> {
@@ -327,6 +239,17 @@ impl Engine {
             anyhow::ensure!(!root.label.trim().is_empty(), "A folder needs a name");
             paths.push((root.path.clone(), identity));
         }
+        if let Some(destination) = config.destination.clone() {
+            if current.destination.as_ref() == Some(&destination) {
+                folder::validate(Path::new(&destination.path), &config, &self.state)?;
+            } else {
+                config.destination = Some(folder::select(
+                    Path::new(&destination.path),
+                    &config,
+                    &self.state,
+                )?);
+            }
+        }
         for rule in &config.rules {
             anyhow::ensure!(
                 rule.scope == "global" || ids.contains(&rule.scope),
@@ -339,6 +262,9 @@ impl Engine {
         let mut bytes = 0;
         let mut examples = vec![];
         let mut warnings = vec![];
+        if config.destination != current.destination {
+            warnings.push("All included source files will be copied to this destination. Existing backups stay where they are. Folder selections and exclusions are preserved.".into());
+        }
         for root in config.roots.iter().filter(|r| r.enabled) {
             walk_root(root, |path, relative| {
                 match filesystem::eligible(path) {
@@ -391,6 +317,29 @@ impl Engine {
         Ok(preview)
     }
     pub fn apply_preview(&self, token: &str) -> Result<()> {
+        let _run = self.run_lock.try_lock().map_err(|_| {
+            anyhow::anyhow!("Backup is finishing a file; try applying again in a moment")
+        })?;
+        self.apply_locked(token)
+    }
+    pub async fn apply_when_idle(self: &Arc<Self>, token: String) -> Result<()> {
+        anyhow::ensure!(
+            !self.applying.swap(true, Ordering::SeqCst),
+            "Another configuration review is being applied"
+        );
+        struct Reset<'a>(&'a AtomicBool);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _reset = Reset(&self.applying);
+        let _guard = self.run_lock.lock().await;
+        let engine = self.clone();
+        tokio::task::spawn_blocking(move || engine.apply_locked(&token)).await?
+    }
+    fn apply_locked(&self, token: &str) -> Result<()> {
+        let _scan = self.scan_lock.lock().unwrap();
         let preview = self
             .previews
             .lock()
@@ -405,13 +354,19 @@ impl Engine {
                 "A selected folder was replaced since the preview"
             );
         }
-        let mut s = self.store.lock().unwrap();
         anyhow::ensure!(
-            !self.cleanup_running.load(Ordering::SeqCst),
-            "Wait for cloud cleanup to finish before changing exclusions"
+            self.config()?.revision == preview.config.revision - 1,
+            "Configuration changed. Preview again."
         );
+        if let Some(destination) = &preview.config.destination {
+            folder::initialize(destination, &preview.config, &self.state)?;
+        }
+        let mut s = self.store.lock().unwrap();
         s.save_config(&preview.config, preview.config.revision - 1)?;
+        self.progress.lock().unwrap().last_backup =
+            s.setting::<Option<i64>>("lastBackup")?.flatten();
         drop(s);
+        self.force.store(true, Ordering::SeqCst);
         self.rescan();
         Ok(())
     }
@@ -495,7 +450,7 @@ impl Engine {
             if include {
                 "Include selected item"
             } else {
-                "Exclude selected item; keep cloud copies"
+                "Exclude selected item; keep backup copies"
             }
             .into(),
         )
@@ -512,7 +467,7 @@ impl Engine {
             if !root.enabled {
                 for mut item in self.items()?.into_iter().filter(|i| i.root_id == root.id) {
                     item.status = Status::Excluded;
-                    item.reason = "Folder backup is disabled; cloud copies retained".into();
+                    item.reason = "Folder backup is disabled; backup copies retained".into();
                     self.store.lock().unwrap().put_item(&item)?;
                 }
                 continue;
@@ -561,7 +516,7 @@ impl Engine {
                         item.status = Status::Excluded;
                         item.reason = decision.reason;
                     } else if item.status != Status::Issue
-                        || !item.reason.starts_with("Cloud conflict:")
+                        || !item.reason.starts_with("Backup conflict:")
                     {
                         // Hash the stable source on every reconciliation; timestamps alone never establish green.
                         match filesystem::locked_source(path, Path::new(&root.path))
@@ -601,7 +556,7 @@ impl Engine {
                     i.root_id == root.id && !seen.contains(&i.relative_path.to_lowercase())
                 }) {
                     item.status = Status::Retained;
-                    item.reason = "Local item is absent; cloud versions retained".into();
+                    item.reason = "Local item is absent; backup versions retained".into();
                     self.store.lock().unwrap().put_item(&item)?;
                 }
                 Ok(())
@@ -621,7 +576,7 @@ impl Engine {
             .filter(|i| !config.roots.iter().any(|r| r.id == i.root_id))
         {
             item.status = Status::Retained;
-            item.reason = "Folder removed from configuration; cloud versions retained".into();
+            item.reason = "Folder removed from configuration; backup versions retained".into();
             self.store.lock().unwrap().put_item(&item)?;
         }
         self.store.lock().unwrap().set("scanErrors", &failures)?;
@@ -716,7 +671,7 @@ impl Engine {
         Ok(())
     }
     pub async fn run(self: Arc<Self>) {
-        // This task never scans or waits for a cloud request. Its lifetime follows the engine.
+        // This task never scans or waits for a destination transfer. Its lifetime follows the engine.
         let weak = Arc::downgrade(&self);
         let status_task = tokio::spawn(async move {
             let mut notification: Option<tokio::task::JoinHandle<()>> = None;
@@ -749,17 +704,12 @@ impl Engine {
             cache: self.cache.clone(),
         };
         let mut reconciled = 0;
-        let mut remote_checked = 0;
+        let mut destination_checked = 0;
         loop {
             if self.stopping.load(Ordering::SeqCst) {
                 break;
             }
             let _guard = self.run_lock.lock().await;
-            if self.cleanup_running.load(Ordering::SeqCst) {
-                drop(_guard);
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                continue;
-            }
             let forced = self.force.swap(false, Ordering::SeqCst);
             let config = match self.config() {
                 Ok(c) => c,
@@ -784,19 +734,17 @@ impl Engine {
             }
             if config.paused() {
                 self.phase("paused", "Backup is paused");
-            } else if !self.auth.connected().await {
-                self.phase("disconnected", "Connect Google Drive to begin backup");
-            } else if config.pause_on_metered && metered() {
+            } else if config.destination.is_none() {
                 self.phase(
-                    "metered",
-                    "Backup waits while this connection is metered or its cost is unknown",
+                    "disconnected",
+                    "Choose a backup destination. Your saved folders and exclusions are ready.",
                 );
             } else if config.continuous || forced {
                 let result = async {
-                    if now() - remote_checked >= 300 || forced {
-                        self.refresh_account().await?;
-                        self.check_remote().await?;
-                        remote_checked = now();
+                    folder::base(&config)?;
+                    if now() - destination_checked >= 300 || forced {
+                        self.check_destination().await?;
+                        destination_checked = now();
                     }
                     self.save_catalog().await?;
                     self.backup_pending().await?;
@@ -849,24 +797,35 @@ impl Engine {
             tokio::select! {_=self.wake.notified()=>tokio::time::sleep(Duration::from_millis(750)).await,_=tokio::time::sleep(Duration::from_secs(5))=>{}}
         }
     }
-    async fn check_remote(&self) -> Result<()> {
-        for mut item in self.items()?.into_iter().filter(|i| {
-            i.current.is_some() && i.status != Status::Retained && i.status != Status::Excluded
-        }) {
-            self.permitted()?;
-            let version = item.current.as_ref().unwrap();
-            if !self
-                .drive
-                .metadata(&version.remote_id)
-                .await?
-                .is_some_and(|m| m.matches_version(version))
-            {
-                item.status = Status::Issue;
-                item.reason="Cloud conflict: the verified Drive copy changed or was removed. Restore/review it, then acknowledge to create a separate new snapshot.".into();
-                self.store.lock().unwrap().put_item(&item)?;
+    async fn check_destination(self: &Arc<Self>) -> Result<()> {
+        let engine = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let config = engine.config()?;
+            for mut item in engine.items()?.into_iter().filter(|i| i.current.is_some() && !matches!(i.status, Status::Retained | Status::Excluded)) {
+                engine.permitted()?;
+                if !folder::matches(&config, item.current.as_ref().unwrap())? {
+                    item.status = Status::Issue;
+                    item.reason = "Backup conflict: a saved version changed or disappeared. Review it, then acknowledge to create a new snapshot.".into();
+                    engine.store.lock().unwrap().put_item(&item)?;
+                } else if let Some(root) = config.roots.iter().find(|r|r.id==item.root_id) {
+                    let readable=folder::resolve(&config,&folder::reference(&config,&folder::latest_relative(&config,root,&item)?)?)?;
+                    if !readable.try_exists()? {
+                        item.status=Status::Pending;
+                        item.reason="Readable copy is missing; rebuilding it from the source".into();
+                        engine.store.lock().unwrap().put_item(&item)?;
+                    } else {
+                        let (sha,_,size)=staging::hashes(File::open(readable)?)?;
+                        let version=item.current.as_ref().unwrap();
+                        if sha!=version.sha256 || size!=version.size {
+                            item.status=Status::Issue;
+                            item.reason="Backup conflict: the readable destination file changed. Acknowledge to preserve it separately and create a fresh backup.".into();
+                            engine.store.lock().unwrap().put_item(&item)?;
+                        }
+                    }
+                }
             }
-        }
-        Ok(())
+            Ok::<_, anyhow::Error>(())
+        }).await?
     }
     pub fn acknowledge_conflict(&self, item_id: &str) -> Result<()> {
         let mut item = self
@@ -876,84 +835,17 @@ impl Engine {
             .item(item_id)?
             .context("Unknown file")?;
         anyhow::ensure!(
-            item.reason.starts_with("Cloud conflict:"),
-            "No cloud conflict to acknowledge"
+            item.reason.starts_with("Backup conflict:"),
+            "No backup conflict to acknowledge"
         );
         if let Some(previous) = item.current.take() {
             item.history.push(previous);
         }
         item.status = Status::Pending;
-        item.reason = "Cloud conflict acknowledged; a new separate backup will be created".into();
+        item.reason = "Backup conflict acknowledged; a new separate backup will be created".into();
         self.store.lock().unwrap().put_item(&item)?;
         self.rescan();
         Ok(())
-    }
-    async fn folder(
-        &self,
-        key: &str,
-        name: &str,
-        parent: Option<&str>,
-        device: &str,
-    ) -> Result<String> {
-        let existing = self.store.lock().unwrap().remote_path(key)?;
-        let id = match existing {
-            Some(id) => id,
-            None => {
-                let id = self.drive.generate_id().await?;
-                self.store.lock().unwrap().set_remote_path(key, &id)?;
-                id
-            }
-        };
-        self.drive.folder(&id, name, parent, device, key).await?;
-        Ok(id)
-    }
-    async fn destination(&self, config: &Config, root: &Root, relative: &str) -> Result<String> {
-        let base = self
-            .folder("base", "OmniSync", None, &config.device_id)
-            .await?;
-        let device = self
-            .folder(
-                "device",
-                &format!("Device {}", &config.device_id[..8]),
-                Some(&base),
-                &config.device_id,
-            )
-            .await?;
-        let root_folder = self
-            .folder(
-                &format!("root:{}", root.id),
-                &root.label,
-                Some(&device),
-                &config.device_id,
-            )
-            .await?;
-        let mut parent = self
-            .folder(
-                &format!("files:{}", root.id),
-                "Files",
-                Some(&root_folder),
-                &config.device_id,
-            )
-            .await?;
-        let parts: Vec<_> = relative.split('/').collect();
-        let mut path = String::new();
-        for part in parts.iter().take(parts.len().saturating_sub(1)) {
-            path.push_str(part);
-            path.push('/');
-            parent = self
-                .folder(
-                    &format!("dir:{}:{path}", root.id),
-                    part,
-                    Some(&parent),
-                    &config.device_id,
-                )
-                .await?;
-        }
-        let mut account = self.account()?;
-        account.base_id = Some(base);
-        account.device_folder_id = Some(device);
-        self.store.lock().unwrap().set("account", &account)?;
-        Ok(parent)
     }
     async fn backup_pending(self: &Arc<Self>) -> Result<()> {
         let mut checkpoint = std::time::Instant::now();
@@ -965,14 +857,14 @@ impl Engine {
         {
             self.permitted()?;
             if completed > 0
-                && (item.size >= CHUNK as u64 || checkpoint.elapsed() >= Duration::from_secs(5))
+                && (item.size >= 8 * 1024 * 1024 || checkpoint.elapsed() >= Duration::from_secs(5))
             {
                 self.save_catalog().await?;
                 completed = 0;
                 checkpoint = std::time::Instant::now();
             }
             let config = self.config()?;
-            if item.reason == "Upload verified; publishing recovery catalog" {
+            if item.reason == "Copy verified; publishing recovery catalog" {
                 continue;
             }
             let Some(root) = config
@@ -1016,7 +908,7 @@ impl Engine {
                 }
             };
             item.status = Status::Syncing;
-            item.reason = "Uploading an immutable snapshot".into();
+            item.reason = "Copying a verified snapshot".into();
             self.store.lock().unwrap().put_item(&item)?;
             self.phase("syncing", "Backing up changes");
             {
@@ -1026,7 +918,15 @@ impl Engine {
                 p.total = job.size;
             }
             self.publish_cache()?;
-            let result = self.upload_item(&config, root, &item, &mut job).await;
+            let worker = self.clone();
+            let copy_config = config.clone();
+            let copy_root = root.clone();
+            let copy_item = item.clone();
+            let copy_job = job.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                worker.copy_item(&copy_config, &copy_root, &copy_item, &copy_job)
+            })
+            .await?;
             match result {
                 Ok(version) => {
                     let mut latest = self
@@ -1039,7 +939,7 @@ impl Engine {
                         latest.history.push(old);
                     }
                     latest.status = Status::Pending;
-                    latest.reason = "Upload verified; publishing recovery catalog".into();
+                    latest.reason = "Copy verified; publishing recovery catalog".into();
                     self.store.lock().unwrap().commit_verified(&latest)?;
                     self.remove_stage(&job);
                     completed += 1;
@@ -1055,7 +955,7 @@ impl Engine {
                     job.retry_at =
                         now() + (5_i64.saturating_mul(2_i64.pow(job.attempts.min(9)))).min(1800);
                     self.store.lock().unwrap().put_job(&job)?;
-                    item.status = if error.to_string().starts_with("Cloud conflict:") {
+                    item.status = if error.to_string().starts_with("Backup conflict:") {
                         Status::Issue
                     } else {
                         Status::Pending
@@ -1091,204 +991,95 @@ impl Engine {
         self.remove_stage(job);
         Ok(())
     }
-    async fn upload_item(
-        &self,
-        config: &Config,
-        root: &Root,
-        item: &Item,
-        job: &mut Job,
-    ) -> Result<Version> {
+    fn copy_item(&self, config: &Config, root: &Root, item: &Item, job: &Job) -> Result<Version> {
         staging::verify_stage(job, &self.state)?;
-        if let Some(version) = &item.current {
-            anyhow::ensure!(
-                self.drive
-                    .metadata(&version.remote_id)
-                    .await?
-                    .is_some_and(|m| m.matches_version(version)),
-                "Cloud conflict: existing backup changed. Review the file before continuing."
-            );
-        }
-        if job.parent_id.is_none() {
-            job.parent_id = Some(self.destination(config, root, &item.relative_path).await?);
-            self.store.lock().unwrap().put_job(job)?;
-        }
-        let name = snapshot_name(&item.relative_path, &job.id);
-        self.transfer(job, &name, &config.device_id, &item.id, false)
-            .await?;
-        Ok(Version {
-            remote_id: job.target_id.clone().unwrap(),
+        let relative = format!(
+            "{}/versions/{}/{}/{}/{}",
+            config.device_id,
+            root.id,
+            item.id,
+            job.id,
+            Path::new(&item.relative_path)
+                .file_name()
+                .context("Invalid source filename")?
+                .to_string_lossy()
+        );
+        let reference = folder::reference(config, &relative)?;
+        let target = folder::resolve(config, &reference)?;
+        let version = Version {
+            remote_id: reference,
             sha256: job.sha256.clone(),
             md5: job.md5.clone(),
             size: job.size,
             verified_at: now(),
-        })
-    }
-    async fn transfer(
-        &self,
-        job: &mut Job,
-        name: &str,
-        device: &str,
-        item: &str,
-        catalog: bool,
-    ) -> Result<()> {
-        if job.target_id.is_none() {
-            job.target_id = Some(self.drive.generate_id().await?);
-            self.persist_job(job, catalog)?;
-        }
-        let target = job.target_id.clone().unwrap();
-        if let Some(meta) = self.drive.metadata(&target).await? {
+        };
+        if !target.try_exists()? {
             anyhow::ensure!(
-                meta.matches(&job.sha256, &job.md5, job.size)
-                    && meta.app_properties.get("omniDevice").map(String::as_str) == Some(device)
-                    && meta.app_properties.get("omniItem").map(String::as_str) == Some(item),
-                "Existing upload ID does not match this snapshot"
+                filesystem::free_space(&folder::base(config)?)?
+                    >= job
+                        .size
+                        .saturating_mul(2)
+                        .saturating_add(config.free_space_reserve_bytes),
+                "Destination needs more free space for the snapshot and readable copy"
             );
-            return Ok(());
-        }
-        if job.size == 0 {
-            let meta = self
-                .drive
-                .empty_file(
-                    &target,
-                    name,
-                    job.parent_id.as_deref().context("Missing upload parent")?,
-                    device,
-                    item,
-                )
-                .await?;
-            anyhow::ensure!(
-                meta.matches(&job.sha256, &job.md5, 0),
-                "Empty file verification failed"
-            );
-            return Ok(());
-        }
-        let mut completed = false;
-        if let Some(encrypted) = &job.session {
-            let url = String::from_utf8(security::unprotect(encrypted)?)?;
-            match self.drive.upload(&url, 0, job.size, None).await? {
-                UploadReply::Progress(offset) => job.offset = offset,
-                UploadReply::Complete(meta) => {
-                    anyhow::ensure!(
-                        meta.matches(&job.sha256, &job.md5, job.size),
-                        "Remote checksum mismatch"
-                    );
-                    completed = true;
-                }
-                UploadReply::Expired => {
-                    job.session = None;
-                    job.offset = 0;
-                }
-            }
-            self.persist_job(job, catalog)?;
-        }
-        if !completed && job.session.is_none() {
-            let url = self
-                .drive
-                .start_upload(
-                    &target,
-                    false,
-                    name,
-                    job.parent_id.as_deref().context("Upload parent missing")?,
-                    job.size,
-                    device,
-                    item,
-                )
-                .await?;
-            job.session = Some(security::protect(url.as_bytes())?);
-            job.offset = 0;
-            self.persist_job(job, catalog)?;
-        }
-        let mut input = File::open(&job.stage)?;
-        while !completed {
-            self.permitted()?;
-            if !catalog {
-                let c = self.config()?;
-                let current = self
-                    .store
-                    .lock()
-                    .unwrap()
-                    .item(item)?
-                    .context("File missing")?;
-                anyhow::ensure!(
-                    c.roots.iter().any(|r| r.id == current.root_id && r.enabled)
-                        && Matcher::new(&c.rules)?
-                            .decide(&current.root_id, &current.relative_path)?
-                            .included,
-                    "File was excluded; upload paused"
-                );
-            }
-            let config = self.config()?;
-            anyhow::ensure!(
-                !config.pause_on_metered || !metered(),
-                "Waiting for an unmetered connection"
-            );
-            let remaining = job.size.saturating_sub(job.offset);
-            let length = remaining.min(CHUNK as u64) as usize;
-            input.seek(SeekFrom::Start(job.offset))?;
-            let mut buffer = vec![0u8; length];
-            input.read_exact(&mut buffer)?;
-            let url = String::from_utf8(security::unprotect(job.session.as_ref().unwrap())?)?;
             let start = std::time::Instant::now();
-            let previous = job.offset;
-            match self
-                .drive
-                .upload(&url, job.offset, job.size, Some(buffer))
-                .await?
-            {
-                UploadReply::Progress(offset) => {
-                    anyhow::ensure!(
-                        offset > previous || job.size == 0,
-                        "Upload made no progress"
-                    );
-                    job.offset = offset;
-                }
-                UploadReply::Complete(meta) => {
-                    anyhow::ensure!(
-                        meta.matches(&job.sha256, &job.md5, job.size),
-                        "Remote checksum mismatch; backup is not marked complete"
-                    );
-                    job.offset = job.size;
-                    completed = true;
-                }
-                UploadReply::Expired => {
-                    job.session = None;
-                    job.offset = 0;
-                    self.persist_job(job, catalog)?;
-                    bail!("Upload session expired; a fresh session will be reconciled on retry");
-                }
-            }
-            self.persist_job(job, catalog)?;
-            self.progress.lock().unwrap().sent = job.offset;
-            if let Some(kib) = config.upload_limit_kib {
-                let target = Duration::from_secs_f64(length as f64 / (kib.max(1) as f64 * 1024.0));
-                while start.elapsed() < target {
+            folder::copy_verified(
+                Path::new(&job.stage),
+                &target,
+                &job.sha256,
+                job.size,
+                false,
+                |sent| {
                     self.permitted()?;
-                    tokio::time::sleep(
-                        target
-                            .saturating_sub(start.elapsed())
-                            .min(Duration::from_millis(250)),
-                    )
-                    .await;
-                }
+                    self.progress.lock().unwrap().sent = sent;
+                    if let Some(limit) = config.upload_limit_kib {
+                        let expected =
+                            Duration::from_secs_f64(sent as f64 / (limit as f64 * 1024.0));
+                        while start.elapsed() < expected {
+                            self.permitted()?;
+                            std::thread::sleep(
+                                Duration::from_millis(50)
+                                    .min(expected.saturating_sub(start.elapsed())),
+                            );
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+        } else {
+            anyhow::ensure!(
+                folder::matches(config, &version)?,
+                "Backup conflict: an interrupted snapshot was changed"
+            );
+        }
+        let latest = folder::resolve(
+            config,
+            &folder::reference(config, &folder::latest_relative(config, root, item)?)?,
+        )?;
+        if latest.try_exists()? {
+            let (sha, _, size) = staging::hashes(File::open(&latest)?)?;
+            if sha == job.sha256 && size == job.size {
+                return Ok(version);
+            }
+            if let Some(previous) = &item.current {
+                anyhow::ensure!(sha==previous.sha256 && size==previous.size,"Backup conflict: the readable destination file changed. Review and acknowledge it first.");
+            } else {
+                // After acknowledgment, preserve an independently edited readable file.
+                let relative = format!(
+                    "{}/conflicts/{}/{}/{}",
+                    config.device_id,
+                    item.id,
+                    id(),
+                    latest.file_name().unwrap().to_string_lossy()
+                );
+                let retained = folder::resolve(config, &folder::reference(config, &relative)?)?;
+                folder::copy_verified(&latest, &retained, &sha, size, false, |_| self.permitted())?;
             }
         }
-        let meta = self
-            .drive
-            .metadata(&target)
-            .await?
-            .context("Uploaded file cannot be verified")?;
-        anyhow::ensure!(
-            meta.matches(&job.sha256, &job.md5, job.size),
-            "Final remote verification failed"
-        );
-        Ok(())
-    }
-    fn persist_job(&self, job: &Job, catalog: bool) -> Result<()> {
-        if catalog {
-            self.store.lock().unwrap().set("catalogJob", &Some(job))
-        } else {
-            self.store.lock().unwrap().put_job(job)
-        }
+        folder::copy_verified(&target, &latest, &job.sha256, job.size, true, |_| {
+            self.permitted()
+        })?;
+        Ok(version)
     }
     async fn save_catalog(self: &Arc<Self>) -> Result<()> {
         if !self
@@ -1301,22 +1092,11 @@ impl Engine {
             return Ok(());
         }
         self.permitted()?;
-        let config = self.config()?;
-        let parent = self
-            .account()?
-            .device_folder_id
-            .context("Device folder is missing")?;
-        let saved = self
-            .store
-            .lock()
-            .unwrap()
-            .setting::<Option<Job>>("catalogJob")?
-            .flatten();
-        let mut job = if let Some(job) = saved {
-            job
-        } else {
+        let engine = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let config = engine.config()?;
             let catalog = Catalog {
-                schema_version: 1,
+                schema_version: 2,
                 device_id: config.device_id.clone(),
                 committed_at: now(),
                 roots: config
@@ -1328,61 +1108,25 @@ impl Engine {
                         is_file: r.is_file,
                     })
                     .collect(),
-                items: self.items()?,
+                items: engine.items()?,
             };
-            let bytes = serde_json::to_vec_pretty(&catalog)?;
-            let id = id();
-            let path = self.state.join("staging").join(format!("{id}.catalog"));
-            std::fs::create_dir_all(path.parent().unwrap())?;
-            filesystem::write_durable(&path, &bytes)?;
-            let (sha, md5, size) = staging::hashes(bytes.as_slice())?;
-            let job = Job {
-                id: id.clone(),
-                item_id: "catalog".into(),
-                generation: 0,
-                config_revision: config.revision,
-                stage: path.to_string_lossy().into(),
-                size,
-                sha256: sha,
-                md5,
-                target_id: None,
-                parent_id: Some(parent),
-                history_id: None,
-                history_saved: false,
-                session: None,
-                offset: 0,
-                phase: "catalog".into(),
-                attempts: 0,
-                retry_at: 0,
-            };
-            self.persist_job(&job, true)?;
-            job
-        };
-        let name = format!("OmniSync-catalog-{}.json", job.id);
-        self.transfer(&mut job, &name, &config.device_id, "catalog", true)
-            .await?;
-        self.drive
-            .mark_catalog(job.target_id.as_ref().unwrap())
-            .await?;
-        let catalog: Catalog = serde_json::from_reader(File::open(&job.stage)?)?;
-        self.store.lock().unwrap().commit_catalog(
-            &catalog,
-            job.target_id.as_ref().unwrap(),
-            now(),
-        )?;
-        self.remove_stage(&job);
-        self.progress.lock().unwrap().last_backup = Some(now());
-        let engine = self.clone();
-        tokio::task::spawn_blocking(move || engine.reconcile_cataloged()).await??;
-        Ok(())
+            let reference = folder::save_catalog(&config, &catalog, &engine.state)?;
+            engine
+                .store
+                .lock()
+                .unwrap()
+                .commit_catalog(&catalog, &reference, now())?;
+            engine.progress.lock().unwrap().last_backup = Some(now());
+            engine.reconcile_cataloged()
+        })
+        .await?
     }
     fn reconcile_cataloged(&self) -> Result<()> {
         let config = self.config()?;
         let matcher = Matcher::new(&config.rules)?;
         // Recheck only newly uploaded sources, not the entire tree on an async thread.
         for mut item in self.items()?.into_iter().filter(|i| {
-            i.status == Status::Pending
-                && i.reason == "Upload verified; publishing recovery catalog"
+            i.status == Status::Pending && i.reason == "Copy verified; publishing recovery catalog"
         }) {
             let Some(version) = &item.current else {
                 continue;
@@ -1432,41 +1176,16 @@ impl Engine {
         self.publish_cache()
     }
     pub async fn catalogs(&self) -> Result<Value> {
-        Ok(serde_json::to_value(self.drive.list_catalogs().await?)?)
+        let config = self.config()?;
+        tokio::task::spawn_blocking(move || Ok(serde_json::to_value(folder::catalogs(&config)?)?))
+            .await?
     }
     pub async fn read_catalog(&self, id: &str) -> Result<Catalog> {
-        let meta = self
-            .drive
-            .metadata(id)
-            .await?
-            .context("Catalog is unavailable")?;
-        anyhow::ensure!(
-            meta.app_properties.get("omniRole").map(String::as_str) == Some("catalog")
-                && meta
-                    .size
-                    .as_deref()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(u64::MAX)
-                    <= 64 * 1024 * 1024,
-            "Not a supported OmniSync catalog (maximum 64 MiB)"
-        );
-        let path = self
-            .state
-            .join(format!("catalog-{}.tmp", crate::model::id()));
-        let result = async {
-            self.drive.download(id, &path, 64 * 1024 * 1024).await?;
-            let catalog: Catalog = serde_json::from_slice(&std::fs::read(&path)?)?;
-            anyhow::ensure!(catalog.schema_version == 1, "Unsupported catalog version");
-            for item in &catalog.items {
-                filesystem::safe_relative(&item.relative_path)?;
-            }
-            Ok(catalog)
-        }
-        .await;
-        let _ = std::fs::remove_file(path);
-        result
+        let config = self.config()?;
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || folder::read_catalog(&config, &id)).await?
     }
-    pub async fn restore(
+    pub fn restore(
         &self,
         version: Version,
         relative: String,
@@ -1484,6 +1203,12 @@ impl Engine {
             !filesystem::contains(&self.state, &destination),
             "Cannot restore into application state"
         );
+        if let Some(backup) = self.config()?.destination {
+            anyhow::ensure!(
+                !filesystem::contains(Path::new(&backup.path), &destination),
+                "Choose a restore location outside the backup destination"
+            );
+        }
         let relative = filesystem::safe_relative(&relative)?;
         let target = destination.join(relative);
         anyhow::ensure!(
@@ -1519,19 +1244,20 @@ impl Engine {
             anyhow::ensure!(n < 1000, "Too many conflicting restore names");
         }
         let partial = parent.join(format!(".omnisync-{}.partial", id()));
-        let result = async {
-            let remote = self
-                .drive
-                .metadata(&version.remote_id)
-                .await?
-                .context("Backup version is unavailable")?;
+        let result = (|| -> Result<String> {
+            let config = self.config()?;
             anyhow::ensure!(
-                remote.matches_version(&version),
-                "Cloud version changed; restore stopped"
+                folder::matches(&config, &version)?,
+                "Backup bytes changed; restore stopped"
             );
-            self.drive
-                .download(&version.remote_id, &partial, version.size)
-                .await?;
+            folder::copy_verified(
+                &folder::resolve(&config, &version.remote_id)?,
+                &partial,
+                &version.sha256,
+                version.size,
+                false,
+                |_| Ok(()),
+            )?;
             let (sha, md5, size) = staging::hashes(File::open(&partial)?)?;
             anyhow::ensure!(
                 sha == version.sha256 && md5 == version.md5 && size == version.size,
@@ -1544,8 +1270,7 @@ impl Engine {
             );
             filesystem::move_new(&partial, &target)?;
             Ok(filesystem::display(&target))
-        }
-        .await;
+        })();
         let _ = std::fs::remove_file(partial);
         result
     }
@@ -1600,45 +1325,129 @@ fn aggregate(current: u32, next: u32) -> u32 {
         current
     }
 }
-fn metered() -> bool {
-    let initialized = unsafe {
-        windows::Win32::System::WinRT::RoInitialize(
-            windows::Win32::System::WinRT::RO_INIT_MULTITHREADED,
-        )
-        .is_ok()
-    };
-    use windows::Networking::Connectivity::{NetworkCostType, NetworkInformation};
-    let result = (|| -> windows::core::Result<bool> {
-        let profile = NetworkInformation::GetInternetConnectionProfile()?;
-        let cost = profile.GetConnectionCost()?;
-        Ok(cost.NetworkCostType()? != NetworkCostType::Unrestricted
-            || cost.Roaming()?
-            || cost.OverDataLimit()?)
-    })();
-    if initialized {
-        unsafe {
-            windows::Win32::System::WinRT::RoUninitialize();
-        }
-    }
-    result.unwrap_or(true)
-}
-fn snapshot_name(relative: &str, id: &str) -> String {
-    let path = Path::new(relative);
-    let name = path.file_stem().unwrap_or_default().to_string_lossy();
-    let extension = path
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_default();
-    format!(
-        "{name} [{}-{}]{extension}",
-        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
-        &id[..8]
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn choose_destination(engine: &Engine, path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        let mut config = engine.config().unwrap();
+        config.free_space_reserve_bytes = 1024 * 1024;
+        config.destination = Some(Destination {
+            path: filesystem::display(path),
+            id: String::new(),
+        });
+        let preview = engine.preview(config, "Change destination".into()).unwrap();
+        engine.apply_preview(&preview.token).unwrap();
+    }
+    async fn copy_pass(engine: &Arc<Engine>) {
+        engine.scan().unwrap();
+        engine.dirty.store(false, Ordering::SeqCst);
+        engine.backup_pending().await.unwrap();
+        engine.save_catalog().await.unwrap();
+    }
+    #[tokio::test]
+    async fn folder_backup_restore_versions_exclusions_switch_and_restart() {
+        let (temp, engine, source) = fixture();
+        select(&engine, &source);
+        let selections = serde_json::to_value(engine.config().unwrap().roots).unwrap();
+        let rules = serde_json::to_value(engine.config().unwrap().rules).unwrap();
+        choose_destination(&engine, &temp.path().join("destination-a"));
+        copy_pass(&engine).await;
+        let config = engine.config().unwrap();
+        let item = engine
+            .items()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.relative_path == "keep.txt")
+            .unwrap();
+        let first = item.current.clone().unwrap();
+        assert_eq!(engine.snapshot().await.unwrap().counts.backed_up, 1);
+        let readable = folder::resolve(
+            &config,
+            &folder::reference(
+                &config,
+                &folder::latest_relative(&config, &config.roots[0], &item).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&readable).unwrap(), b"original");
+        assert!(!readable.with_file_name("skip.tmp").exists());
+        std::fs::write(source.join("keep.txt"), b"next version").unwrap();
+        copy_pass(&engine).await;
+        let current = engine
+            .items()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == item.id)
+            .unwrap();
+        assert_eq!(current.history.len(), 1);
+        assert_eq!(std::fs::read(&readable).unwrap(), b"next version");
+        assert!(folder::matches(&config, &first).unwrap());
+        let restore = temp.path().join("restored");
+        std::fs::create_dir(&restore).unwrap();
+        std::fs::write(restore.join("keep.txt"), b"retain me").unwrap();
+        let restored = engine
+            .restore(first.clone(), "keep.txt".into(), restore.clone())
+            .unwrap();
+        assert_eq!(std::fs::read(restored).unwrap(), b"original");
+        assert_eq!(
+            std::fs::read(restore.join("keep.txt")).unwrap(),
+            b"retain me"
+        );
+        let catalogs = engine.catalogs().await.unwrap();
+        let catalog = engine
+            .read_catalog(catalogs[0]["id"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(catalog.schema_version, 2);
+        choose_destination(&engine, &temp.path().join("destination-b"));
+        assert_eq!(engine.snapshot().await.unwrap().counts.backed_up, 0);
+        assert_eq!(
+            serde_json::to_value(engine.config().unwrap().roots).unwrap(),
+            selections
+        );
+        assert_eq!(
+            serde_json::to_value(engine.config().unwrap().rules).unwrap(),
+            rules
+        );
+        copy_pass(&engine).await;
+        assert_eq!(engine.snapshot().await.unwrap().counts.backed_up, 1);
+        assert!(folder::matches(&config, &first).unwrap());
+        assert!(folder::resolve(&engine.config().unwrap(), &first.remote_id).is_err());
+        let new_destination = engine.config().unwrap().destination;
+        drop(engine);
+        let reopened =
+            Engine::open_with_cache(temp.path().join("state"), Cache::isolated().unwrap()).unwrap();
+        assert_eq!(reopened.config().unwrap().destination, new_destination);
+        assert_eq!(reopened.snapshot().await.unwrap().counts.backed_up, 1);
+    }
+    #[tokio::test]
+    async fn missing_drive_and_changed_snapshot_never_report_success() {
+        let (temp, engine, source) = fixture();
+        select(&engine, &source);
+        choose_destination(&engine, &temp.path().join("destination"));
+        copy_pass(&engine).await;
+        let config = engine.config().unwrap();
+        let item = engine
+            .items()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.current.is_some())
+            .unwrap();
+        let snapshot = folder::resolve(&config, &item.current.as_ref().unwrap().remote_id).unwrap();
+        std::fs::write(snapshot, b"tampered").unwrap();
+        engine.check_destination().await.unwrap();
+        assert_eq!(engine.snapshot().await.unwrap().counts.issues, 1);
+        std::fs::rename(
+            temp.path().join("destination"),
+            temp.path().join("unplugged"),
+        )
+        .unwrap();
+        assert!(folder::base(&config).is_err());
+        assert!(!temp.path().join("destination").exists());
+        assert_eq!(std::fs::read(source.join("keep.txt")).unwrap(), b"original");
+    }
     #[test]
     fn folder_badges_prefer_actionable_states_and_do_not_let_exclusions_hide_backups() {
         assert_eq!(aggregate(1, 4), 1);
@@ -1791,7 +1600,7 @@ mod tests {
                 verified_at: now(),
             });
             item.status = Status::Pending;
-            item.reason = "Upload verified; publishing recovery catalog".into();
+            item.reason = "Copy verified; publishing recovery catalog".into();
             engine.store.lock().unwrap().commit_verified(item).unwrap();
         }
         let mut catalog = Catalog {

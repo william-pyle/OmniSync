@@ -5,8 +5,9 @@ Unicode true
 !include "x64.nsh"
 !include "WinVer.nsh"
 !include "TextFunc.nsh"
+!include "FileFunc.nsh"
 !ifndef VERSION
-!define VERSION "0.1.1"
+!define VERSION "0.2.0"
 !endif
 !ifndef PAYLOAD
 !error "Pass /DPAYLOAD=<staged files> to makensis"
@@ -32,8 +33,8 @@ VIAddVersionKey "LegalCopyright" "See README for licensing"
 !define MUI_BGCOLOR "FFFFFF"
 !define MUI_TEXTCOLOR "17233B"
 !define MUI_WELCOMEPAGE_TITLE "Welcome to OmniSync"
-!define MUI_WELCOMEPAGE_TEXT "Your files. Your Google Drive.$\r$\n$\r$\nInstall the OmniSync Windows app, tray controls and optional Explorer integration.$\r$\n$\r$\nYour folders stay where they are. Connect Google Drive and choose folders after installation.$\r$\n$\r$\nThis development build is unsigned."
-!define MUI_FINISHPAGE_TEXT "OmniSync is installed.$\r$\n$\r$\nOpen it from the Start menu. Import your Google Desktop OAuth client, connect Google Drive and select your folders.$\r$\n$\r$\nExplorer may need a sign-out or refresh before new badges appear. Setup has not restarted Explorer.$\r$\n$\r$\nOverlay recovery receipts are retained in ProgramData\OmniSync\OverlayBackups."
+!define MUI_WELCOMEPAGE_TEXT "Your files. Your destination.$\r$\n$\r$\nInstall the OmniSync Windows app, tray controls and optional Explorer integration.$\r$\n$\r$\nYour folders stay where they are. Choose a local, synced or network destination after installation. Existing folder selections and exclusions are kept.$\r$\n$\r$\nThis development build is unsigned."
+!define MUI_FINISHPAGE_TEXT "OmniSync is installed.$\r$\n$\r$\nOpen it from the Start menu. Choose a backup destination. Your folder selections and exclusions are preserved; earlier Google Drive backups are untouched.$\r$\n$\r$\nExplorer may need a sign-out or refresh before new badges appear. Setup has not restarted Explorer.$\r$\n$\r$\nOverlay recovery receipts are retained in ProgramData\OmniSync\OverlayBackups."
 !insertmacro MUI_PAGE_WELCOME
 Page custom IntegrationPage IntegrationLeave
 Page custom TakeoverPage TakeoverLeave
@@ -66,6 +67,28 @@ Function .onInit
   InitPluginsDir
   SetOutPath "$PLUGINSDIR"
   File "${PAYLOAD}\omnisync-setup.exe"
+  ${GetParameters} $3
+  ClearErrors
+  ${GetOptions} $3 "/WAITFORAPP" $4
+  ${IfNot} ${Errors}
+    ; The app launches this only after an explicit Install choice. Never kill it.
+    StrCpy $5 0
+    wait_for_app:
+      nsExec::ExecToStack '"$PLUGINSDIR\omnisync-setup.exe" probe-running'
+      Pop $0
+      Pop $1
+      ${If} $0 == 0
+        Goto app_finished
+      ${EndIf}
+      IntOp $5 $5 + 1
+      ${If} $5 >= 300
+        MessageBox MB_ICONEXCLAMATION "OmniSync is still finishing a backup. Wait for it to close, then run setup again."
+        Abort
+      ${EndIf}
+      Sleep 200
+      Goto wait_for_app
+    app_finished:
+  ${EndIf}
   nsExec::ExecToStack '"$PLUGINSDIR\omnisync-setup.exe" probe-running'
   Pop $0
   Pop $1
@@ -168,9 +191,9 @@ Function ReviewPage
   ${If} $2 == ""
     StrCpy $2 "None"
   ${EndIf}
-  ${NSD_CreateLabel} 0 0 100% 150u "Application: OmniSync ${VERSION} (x64)$\r$\n$\r$\nLocation: $PROGRAMFILES64\OmniSync$\r$\n$\r$\nExplorer overlays: $0$\r$\nRight-click commands: $1$\r$\nCompeting registration numbers to disable: $2$\r$\n$\r$\nExplorer refresh: deferred$\r$\nGoogle sign-in and folder selection: after installation"
+  ${NSD_CreateLabel} 0 0 100% 150u "Application: OmniSync ${VERSION} (x64)$\r$\n$\r$\nLocation: $PROGRAMFILES64\OmniSync$\r$\n$\r$\nExplorer overlays: $0$\r$\nRight-click commands: $1$\r$\nCompeting registration numbers to disable: $2$\r$\n$\r$\nExplorer refresh: deferred$\r$\nBackup destination and source selection: after installation"
   Pop $0
-  ${NSD_CreateLabel} 0 165u 100% 55u "Cloud backups, local source files and other sync applications are retained. Microsoft Edge WebView2 Runtime is required; Windows 11 normally includes it. See the README if the app cannot start."
+  ${NSD_CreateLabel} 0 165u 100% 55u "Existing backups, local source files and other sync applications are retained. Microsoft Edge WebView2 Runtime is required; Windows 11 normally includes it. See the README if the app cannot start."
   Pop $0
   nsDialogs::Show
 FunctionEnd
@@ -194,6 +217,8 @@ Section "OmniSync" SEC_APP
   File "${PAYLOAD}\omnisync_shell.dll"
   File "${PAYLOAD}\omnisync-setup.exe"
   File "${PAYLOAD}\README.md"
+  SetOutPath "$INSTDIR\${VERSION}\docs"
+  File "${PAYLOAD}\docs\guide.html"
   SetOutPath "$INSTDIR\${VERSION}\icons"
   File "${PAYLOAD}\icons\*.ico"
   StrCpy $0 "register"
@@ -263,11 +288,13 @@ Section "Uninstall"
   Delete /REBOOTOK "$INSTDIR\${VERSION}\omnisync_shell.dll"
   Delete /REBOOTOK "$INSTDIR\${VERSION}\omnisync-setup.exe"
   Delete "$INSTDIR\${VERSION}\README.md"
+  Delete "$INSTDIR\${VERSION}\docs\guide.html"
+  RMDir "$INSTDIR\${VERSION}\docs"
   Delete "$INSTDIR\${VERSION}\icons\*.ico"
   RMDir "$INSTDIR\${VERSION}\icons"
   RMDir /REBOOTOK "$INSTDIR\${VERSION}"
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\OmniSync"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir /REBOOTOK "$INSTDIR"
-  MessageBox MB_OK "OmniSync was removed. Source files, Google Drive backups, local account state and overlay recovery receipts were retained. A loaded shell DLL may be removed at the next restart; setup will not restart Windows."
+  MessageBox MB_OK "OmniSync was removed. Source files, Google Drive backups, local settings and overlay recovery receipts were retained. A loaded shell DLL may be removed at the next restart; setup will not restart Windows."
 SectionEnd

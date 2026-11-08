@@ -1,0 +1,10 @@
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+const version=JSON.parse(fs.readFileSync('package.json','utf8')).version;
+assert.match(version,/^\d+\.\d+\.\d+$/);
+assert.equal(JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json','utf8')).version,version);
+assert.equal(JSON.parse(fs.readFileSync('package-lock.json','utf8')).version,version);
+assert.equal(fs.readFileSync('Cargo.toml','utf8').match(/^version = "([^"]+)"/m)?.[1],version);
+if(process.env.GITHUB_REF?.startsWith('refs/tags/'))assert.equal(process.env.GITHUB_REF,`refs/tags/v${version}`);
+assert.ok(fs.existsSync(`docs/releases/${version}.txt`),'Release notes missing');
+console.log(`Version ${version} is consistent.`);

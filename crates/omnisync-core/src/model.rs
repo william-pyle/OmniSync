@@ -59,6 +59,7 @@ pub struct Config {
     pub upload_limit_kib: Option<u64>,
     pub start_at_sign_in: bool,
     pub theme: String,
+    pub destination: Option<Destination>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -76,8 +77,15 @@ impl Default for Config {
             upload_limit_kib: None,
             start_at_sign_in: false,
             theme: "system".into(),
+            destination: None,
         }
     }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Destination {
+    pub path: String,
+    pub id: String,
 }
 impl Config {
     pub fn paused(&self) -> bool {
@@ -209,11 +217,9 @@ pub struct Counts {
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub config: Config,
-    pub account: Account,
     pub progress: Progress,
     pub counts: Counts,
     pub recent: Vec<Item>,
-    pub oauth_configured: bool,
     pub version: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -1,10 +1,15 @@
-name: Windows build
+name: Windows build and release
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   build:
     runs-on: windows-2025
@@ -16,27 +21,56 @@ jobs:
           cache: npm
       - name: Install Rust toolchain
         shell: pwsh
-        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
-      - name: Select Rust toolchain
-        shell: pwsh
-        run: rustup default 1.98.1
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default 1.98.1
+      - name: Verify release version
+        run: node scripts/check-version.mjs
       - name: Install NSIS
-        shell: pwsh
         run: choco install nsis --no-progress -y
-      - name: Build and test installer
+      - name: Build and test Windows installer
         shell: pwsh
         run: ./scripts/build.ps1
       - name: Audit source package
-        shell: pwsh
         run: npm run audit:source
       - name: Interface tests in Edge
-        shell: pwsh
         run: npm run test:ui
-      - name: Upload unsigned development installer
+      - name: Upload installer and checksum
         uses: actions/upload-artifact@v4
         with:
-          name: OmniSync-Windows-x64-unsigned
+          name: OmniSync-Windows-x64
           path: |
             out/OmniSync-Setup-*-x64.exe
             out/OmniSync-Setup-*-x64.exe.sha256
           if-no-files-found: error
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: OmniSync-Windows-x64
+          path: release
+      - name: Publish tested installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($env:RELEASE_TAG -cne "v$version") { throw 'Release tag/version mismatch' }
+          $exe = "release/OmniSync-Setup-$version-x64.exe"
+          $expected = (Get-Content "$exe.sha256" -Raw).Split(' ')[0]
+          if ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expected) { throw 'Artifact checksum mismatch' }
+          # Never replace a previously published installer when rerunning a workflow.
+          gh release view $env:RELEASE_TAG --json isDraft | Out-Null
+          if ($LASTEXITCODE -eq 0) { throw 'This release already exists; publish a new version instead' }
+          $notes = "docs/releases/$version.txt"
+          gh release create $env:RELEASE_TAG $exe "$exe.sha256" --verify-tag --title "OmniSync $version" --notes-file $notes --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

@@ -21,6 +21,8 @@ use tauri::{
 struct AppState {
     engine: Arc<Engine>,
     intent: Mutex<Option<Vec<String>>>,
+    update: tokio::sync::Mutex<Option<omnisync_core::update::Update>>,
+    downloaded: tokio::sync::Mutex<Option<(PathBuf, String, u64)>>,
 }
 fn show(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -61,18 +63,6 @@ async fn dispatch(
                 tokio::task::spawn_blocking(move || engine.display_items()).await??,
             )?)
         }
-        "previewCleanup" => {
-            let engine = engine.clone();
-            Ok(serde_json::to_value(
-                tokio::task::spawn_blocking(move || engine.preview_cleanup()).await??,
-            )?)
-        }
-        "applyCleanup" => {
-            let selected: Vec<String> = serde_json::from_value(payload["selected"].clone())?;
-            Ok(serde_json::to_value(
-                engine.apply_cleanup(&text("token")?, &selected).await?,
-            )?)
-        }
         "intent" => Ok(json!(state.intent.lock().unwrap().take())),
         "pickRoot" => {
             let file = payload["file"].as_bool().unwrap_or(false);
@@ -105,7 +95,7 @@ async fn dispatch(
         }
         "apply" => {
             let before = engine.config()?;
-            engine.apply_preview(&text("token")?)?;
+            engine.apply_when_idle(text("token")?).await?;
             let after = engine.config()?;
             if before.start_at_sign_in != after.start_at_sign_in {
                 integration::startup(after.start_at_sign_in, &std::env::current_exe()?)?;
@@ -130,37 +120,62 @@ async fn dispatch(
             engine.sync_now()?;
             Ok(Value::Null)
         }
-        "importOAuth" => {
-            let path = tokio::task::spawn_blocking(|| {
-                rfd::FileDialog::new()
-                    .set_title("Import Google OAuth Desktop app JSON")
-                    .add_filter("Google OAuth client", &["json"])
-                    .pick_file()
-            })
-            .await?;
-            if let Some(path) = path {
-                engine.auth.import_client(&path).await?;
-                Ok(json!(true))
-            } else {
-                Ok(json!(false))
+        "pickDestination" => {
+            let path = tokio::task::spawn_blocking(|| rfd::FileDialog::new()
+                .set_title("Choose a backup destination (local folder, synced folder or network share)").pick_folder()).await?;
+            Ok(json!(path.map(|p| filesystem::display(&p))))
+        }
+        "checkUpdate" => {
+            let available = omnisync_core::update::check(env!("CARGO_PKG_VERSION")).await?;
+            let mut downloaded = state.downloaded.lock().await;
+            let mut saved = state.update.lock().await;
+            if saved.as_ref().map(|u| &u.version) != available.as_ref().map(|u| &u.version) {
+                *downloaded = None;
             }
+            *saved = available.clone();
+            if available.is_some() {
+                show(&app);
+            }
+            Ok(serde_json::to_value(available)?)
         }
-        "connect" => {
-            engine.connect().await?;
+        "downloadUpdate" => {
+            let mut downloaded = state.downloaded.lock().await;
+            let update = state
+                .update
+                .lock()
+                .await
+                .clone()
+                .context("Check for an update first")?;
+            let path = omnisync_core::update::download(&update, &engine.state).await?;
+            let hash_path = path.clone();
+            let (hash, _, size) = tokio::task::spawn_blocking(move || {
+                omnisync_core::staging::hashes(std::fs::File::open(hash_path)?)
+            })
+            .await??;
+            *downloaded = Some((path, hash, size));
             Ok(Value::Null)
         }
-        "disconnect" => {
-            engine.disconnect().await?;
+        "installUpdate" => {
+            let downloaded = state.downloaded.lock().await;
+            let (path, hash, size) = downloaded
+                .as_ref()
+                .context("Download the update first")?
+                .clone();
+            tokio::task::spawn_blocking(move || {
+                omnisync_core::update::verify_download(&path, &hash, size)?;
+                launch_update(&path)
+            })
+            .await??;
+            engine.stop_when_idle().await;
+            app.exit(0);
             Ok(Value::Null)
         }
-        "openDrive" => {
-            let snapshot = engine.snapshot().await?;
-            let url = snapshot
-                .account
-                .base_id
-                .map(|id| format!("https://drive.google.com/drive/folders/{id}"))
-                .unwrap_or_else(|| "https://drive.google.com/".into());
-            integration::open_url(&url)?;
+        "openDestination" => {
+            let config = engine.config()?;
+            let path = omnisync_core::folder::base(&config)?;
+            std::process::Command::new("explorer.exe")
+                .arg(path)
+                .spawn()?;
             Ok(Value::Null)
         }
         "catalogs" => engine.catalogs().await,
@@ -177,7 +192,15 @@ async fn dispatch(
             })
             .await?;
             if let Some(destination) = destination {
-                Ok(json!(engine.restore(version, relative, destination).await?))
+                let engine = engine.clone();
+                Ok(json!(
+                    tokio::task::spawn_blocking(move || engine.restore(
+                        version,
+                        relative,
+                        destination
+                    ))
+                    .await??
+                ))
             } else {
                 Ok(Value::Null)
             }
@@ -228,6 +251,30 @@ async fn dispatch(
         }
         _ => anyhow::bail!("Unknown application command"),
     }
+}
+fn launch_update(path: &std::path::Path) -> Result<()> {
+    use windows::{
+        core::{w, PCWSTR},
+        Win32::UI::{
+            Shell::{ShellExecuteExW, SHELLEXECUTEINFOW},
+            WindowsAndMessaging::SW_SHOWNORMAL,
+        },
+    };
+    let file = omnisync_windows::wide(path);
+    unsafe {
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            lpVerb: w!("runas"),
+            lpFile: PCWSTR(file.as_ptr()),
+            lpParameters: w!("/WAITFORAPP"),
+            nShow: SW_SHOWNORMAL.0,
+            ..Default::default()
+        };
+        ShellExecuteExW(&mut info).context(
+            "Installation was canceled or setup could not start. OmniSync is still running.",
+        )?;
+    }
+    Ok(())
 }
 fn elevated(arguments: &str) -> Result<()> {
     use windows::{
@@ -299,6 +346,8 @@ fn start() -> Result<()> {
             app.manage(AppState {
                 engine: engine.clone(),
                 intent: Mutex::new(Some(initial.clone())),
+                update: tokio::sync::Mutex::new(None),
+                downloaded: tokio::sync::Mutex::new(None),
             });
             let handle = app.handle().clone();
             let open = MenuItem::with_id(app, "open", "Open OmniSync", true, None::<&str>)?;

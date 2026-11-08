@@ -1,0 +1,11 @@
+OmniSync 0.2.0
+
+Choose a backup destination: local folders, Google Drive desktop folders, other synced folders, mapped drives or network shares. Google Drive API and OAuth are no longer used.
+
+Existing source selections and exclusion rules are preserved. After upgrading, choose a destination in Overview or Settings to copy all included source files there. Source files and earlier backups are never moved or deleted. Old Google backup records are archived locally; existing Google copies remain in Google Drive.
+
+Backups contain readable current files, immutable previous versions and recovery catalogs. "Backed up" means verified at your selected folder; consult your cloud client for onward-upload status. Versions are retained, and a readable copy is stored alongside snapshots, so allow enough destination space.
+
+The app checks GitHub Releases on startup and in Settings. Downloading verifies the installer SHA-256; installing requires an explicit choice and Windows administrator confirmation. Setup waits for OmniSync to close without terminating it or Explorer.
+
+This installer is unsigned; Windows may show an unknown-publisher warning. OmniSync 0.1.x has no updater, so install 0.2.0 manually once. Close the old app from its tray menu first. Do not uninstall or delete app data before upgrading.

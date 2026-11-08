@@ -2,3 +2,5 @@ body{margin:0;background:var(--o-bg);color:var(--o-text);font:14px/1.5 'Segoe UI
 .main-panel{margin:0 auto}
 
 .cleanup-list{max-height:45vh;overflow:auto;border:1px solid var(--border,#334155);padding:12px;border-radius:10px}.cleanup-list small{display:block;opacity:.75}.cleanup-list .check-row{align-items:flex-start;overflow-wrap:anywhere}
+
+.destination-path{overflow-wrap:anywhere;word-break:break-word}.update-notes{white-space:pre-wrap;max-height:16rem;overflow:auto;overflow-wrap:anywhere}

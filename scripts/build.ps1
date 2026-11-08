@@ -10,6 +10,8 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "$Program failed with exit code $LASTEXITCODE" }
     }
     Invoke-Checked 'npm.cmd' @('ci')
+    Invoke-Checked 'node.exe' @('scripts/check-version.mjs')
+    Invoke-Checked 'node.exe' @('scripts/build-docs.mjs')
     Invoke-Checked 'npm.cmd' @('run','build')
     if (-not $SkipTests) { Invoke-Checked 'cargo.exe' @('test','--workspace','--locked') }
     Invoke-Checked 'cargo.exe' @('build','--workspace','--release','--locked','--features','omnisync/custom-protocol')
@@ -21,6 +23,8 @@ try {
     }
     Get-ChildItem -LiteralPath (Join-Path $repo 'assets/icons') -Filter '*.ico' | Copy-Item -Destination (Join-Path $payload 'icons') -Force
     Copy-Item -LiteralPath (Join-Path $repo 'README.md') -Destination $payload -Force
+    New-Item -ItemType Directory -Path (Join-Path $payload 'docs') -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repo 'docs/guide.html') -Destination (Join-Path $payload 'docs') -Force
     Invoke-Checked (Join-Path $payload 'omnisync-setup.exe') @('verify-shell')
     if ($Signed) {
         if (-not $env:OMNISYNC_SIGNTOOL -or -not $env:OMNISYNC_CERT_THUMBPRINT -or -not $env:OMNISYNC_TIMESTAMP_URL) { throw 'Set all signing variables before using -Signed.' }

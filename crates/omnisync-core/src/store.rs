@@ -12,16 +12,62 @@ impl Store {
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
         let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 1 {
+        if version > 2 {
             bail!("This database belongs to a newer OmniSync version");
         }
-        db.execute_batch("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE IF NOT EXISTS configs(revision INTEGER PRIMARY KEY,json TEXT NOT NULL);CREATE TABLE IF NOT EXISTS items(id TEXT PRIMARY KEY,root_id TEXT NOT NULL,path_key TEXT NOT NULL,json TEXT NOT NULL,UNIQUE(root_id,path_key));CREATE TABLE IF NOT EXISTS jobs(item_id TEXT PRIMARY KEY,json TEXT NOT NULL);CREATE TABLE IF NOT EXISTS remote_paths(key TEXT PRIMARY KEY,remote_id TEXT NOT NULL);PRAGMA user_version=1;")?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE IF NOT EXISTS configs(revision INTEGER PRIMARY KEY,json TEXT NOT NULL);CREATE TABLE IF NOT EXISTS items(id TEXT PRIMARY KEY,root_id TEXT NOT NULL,path_key TEXT NOT NULL,json TEXT NOT NULL,UNIQUE(root_id,path_key));CREATE TABLE IF NOT EXISTS jobs(item_id TEXT PRIMARY KEY,json TEXT NOT NULL);CREATE TABLE IF NOT EXISTS remote_paths(key TEXT PRIMARY KEY,remote_id TEXT NOT NULL);CREATE TABLE IF NOT EXISTS archived_profiles(id TEXT PRIMARY KEY,created INTEGER NOT NULL,json TEXT NOT NULL);")?;
         let mut store = Self { db };
         store.db.execute_batch("CREATE TABLE IF NOT EXISTS cleanup_events(run_id TEXT NOT NULL,remote_id TEXT NOT NULL,item_id TEXT NOT NULL,phase TEXT NOT NULL,updated INTEGER NOT NULL,PRIMARY KEY(run_id,remote_id));")?;
         if store.setting::<Config>("config")?.is_none() {
             store.save_config(&Config::default(), 0)?;
         }
+        if version == 1 {
+            let archive = store.profile_json()?;
+            let items = store.items()?;
+            let tx = store.db.transaction()?;
+            tx.execute(
+                "INSERT INTO archived_profiles VALUES('legacy-google-drive',?,?)",
+                params![now(), archive],
+            )?;
+            Self::reset_destination(&tx, items)?;
+            tx.pragma_update(None, "user_version", 2)?;
+            tx.commit()?;
+        } else {
+            store.db.pragma_update(None, "user_version", 2)?;
+        }
         Ok(store)
+    }
+    fn profile_json(&self) -> Result<String> {
+        Ok(serde_json::to_string(&serde_json::json!({
+            "config": self.config()?, "items": self.items()?, "jobs": self.jobs()?,
+            "account": self.setting::<serde_json::Value>("account")?,
+            "catalogJob": self.setting::<serde_json::Value>("catalogJob")?
+        }))?)
+    }
+    fn reset_destination(tx: &rusqlite::Transaction<'_>, items: Vec<Item>) -> Result<()> {
+        for mut item in items {
+            item.current = None;
+            item.history.clear();
+            item.cataloged_remote_id = None;
+            item.generation += 1;
+            if !matches!(item.status, Status::Excluded | Status::Retained) {
+                item.status = Status::Pending;
+                item.reason = "Waiting for a verified copy at the selected destination".into();
+            }
+            tx.execute(
+                "UPDATE items SET json=? WHERE id=?",
+                params![serde_json::to_string(&item)?, item.id],
+            )?;
+        }
+        tx.execute("DELETE FROM jobs", [])?;
+        for (key, value) in [
+            ("catalogJob", "null"),
+            ("catalogDirty", "false"),
+            ("lastBackup", "null"),
+        ] {
+            tx.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key,value])?;
+        }
+        Ok(())
     }
     pub fn setting<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         let text: Option<String> = self
@@ -51,7 +97,23 @@ impl Store {
             bail!("Configuration changed. Preview again before saving.");
         }
         let text = serde_json::to_string(config)?;
+        let old = self.setting::<Config>("config")?;
+        let switching = old
+            .as_ref()
+            .is_some_and(|c| c.destination != config.destination);
+        let archive = if switching {
+            Some((self.profile_json()?, self.items()?))
+        } else {
+            None
+        };
         let tx = self.db.transaction()?;
+        if let Some((archive, items)) = archive {
+            tx.execute(
+                "INSERT INTO archived_profiles VALUES(?,?,?)",
+                params![id(), now(), archive],
+            )?;
+            Self::reset_destination(&tx, items)?;
+        }
         tx.execute(
             "INSERT INTO configs VALUES(?,?)",
             params![i64::try_from(config.revision)?, text],
